@@ -1,0 +1,37 @@
+[Unit]
+Description=HobeRadius Central RADIUS Proxy
+Documentation=https://github.com/hoberadius/radius-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hobeproxy
+Group=hobeproxy
+WorkingDirectory=/opt/hobe-radius-proxy
+ExecStart=/opt/hobe-radius-proxy/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Required env vars — set in /etc/hobe-radius-proxy/env
+EnvironmentFile=/etc/hobe-radius-proxy/env
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/hobe-radius-proxy
+
+# RADIUS ports require CAP_NET_BIND_SERVICE (ports < 1024)
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hobe-radius-proxy
+
+[Install]
+WantedBy=multi-user.target
