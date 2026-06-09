@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import struct
 import time
@@ -25,6 +26,8 @@ from typing import Optional
 import radius_packet as rp
 from config import Config
 from routing_table import RoutingTable
+from telemetry import TelemetryEmitter
+from placement_hook import PlacementHook
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +44,9 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         is_accounting: bool = False,
         acct_timeout_mode: str = "strict",
         strict_response_verify: bool = False,
+        telemetry: "Optional[TelemetryEmitter]" = None,
+        placement: "Optional[PlacementHook]" = None,
+        decision_probe: bool = False,
     ):
         self._routing = routing
         self._chr_secret = chr_secret
@@ -49,6 +55,11 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         self._is_accounting = is_accounting
         self._acct_timeout_mode = acct_timeout_mode
         self._strict_response_verify = strict_response_verify
+        # CHR Fleet (Phase 4): optional, non-enforcing observability hooks.
+        # Always guarded so a fault here can never break RADIUS handling.
+        self._telemetry = telemetry
+        self._placement = placement
+        self._decision_probe = decision_probe
         self._transport: Optional[asyncio.DatagramTransport] = None
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
@@ -93,6 +104,15 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
             self._routing.record_request(accepted=False, error=True)
             return
 
+        # 3b. CHR Fleet telemetry (accounting only). In-memory + fast: counts
+        # live sessions and folds octet deltas per node. Fully guarded — a fault
+        # here must never affect RADIUS handling.
+        if self._is_accounting and self._telemetry is not None:
+            try:
+                self._telemetry.record_from_accounting(pkt, src_ip)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("fleet telemetry hook error (ignored): %s", exc)
+
         # 4. Extract realm and look up route
         realm = pkt.realm
         if not realm:
@@ -107,6 +127,28 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
             self._routing.record_request(accepted=False, error=False)
             await self._send_reject(pkt, addr)
             return
+
+        # 4b. CHR Fleet placement (Phase 4): NON-enforcing observability,
+        # offloaded off the event loop. Accounting-Start → report realised
+        # placement (§2 write). Access-Request → advisory decision probe
+        # (read path, log-only). Nothing is moved or disconnected here.
+        if self._placement is not None:
+            try:
+                if self._is_accounting:
+                    self._loop.run_in_executor(
+                        None, self._placement.report_from_accounting, pkt, src_ip
+                    )
+                elif self._decision_probe:
+                    node_name = self._routing.node_name_for(src_ip) or src_ip
+                    self._loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            self._placement.resolve_decision,
+                            realm, current_node=node_name,
+                        ),
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("fleet placement hook error (ignored): %s", exc)
 
         if not route.chr_is_allowed(src_ip):
             log.warning("CHR %s not allowed for realm '%s'", src_ip, realm)
@@ -264,10 +306,54 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         )
 
 
+def _build_fleet_components(
+    config: type, routing: RoutingTable
+) -> "tuple[Optional[TelemetryEmitter], Optional[PlacementHook]]":
+    """Construct the Phase-4 telemetry emitter + placement hook from config.
+
+    Both resolve CHR-IP → registry node names via the routing table, and use the
+    proxy↔panel shared secret for X-Proxy-Token auth. Returns (None, None) for a
+    component when disabled by config.
+    """
+    telemetry: Optional[TelemetryEmitter] = None
+    placement: Optional[PlacementHook] = None
+
+    if getattr(config, "FLEET_TELEMETRY_ENABLED", False):
+        telemetry = TelemetryEmitter(
+            endpoint=config.FLEET_TELEMETRY_ENDPOINT,
+            shared_secret=config.PROXY_SHARED_SECRET,
+            node_resolver=routing.node_name_for,
+            interval=config.FLEET_TELEMETRY_INTERVAL,
+            timeout=config.FLEET_TELEMETRY_TIMEOUT,
+            max_retries=config.FLEET_TELEMETRY_MAX_RETRIES,
+            backoff_base=config.FLEET_TELEMETRY_BACKOFF_BASE,
+            agent_version=config.FLEET_AGENT_VERSION,
+            enabled=True,
+        )
+
+    if getattr(config, "FLEET_PLACEMENT_ENABLED", False):
+        placement = PlacementHook(
+            report_endpoint=config.FLEET_PLACEMENT_REPORT_ENDPOINT,
+            decision_endpoint=config.FLEET_PLACEMENT_DECISION_ENDPOINT,
+            shared_secret=config.PROXY_SHARED_SECRET,
+            proxy_id=config.PROXY_ID,
+            node_resolver=routing.node_name_for,
+            local_candidates_provider=routing.local_node_candidates,
+            timeout=config.FLEET_PLACEMENT_TIMEOUT,
+            decision_cache_ttl=config.FLEET_PLACEMENT_DECISION_TTL,
+            enabled_report=True,
+            enabled_decision=config.FLEET_PLACEMENT_DECISION_PROBE,
+        )
+    return telemetry, placement
+
+
 async def run_proxy(config: type, routing: RoutingTable) -> None:
     """Main proxy coroutine — runs Auth + Acct servers + heartbeat loop."""
     loop = asyncio.get_event_loop()
     start_time = time.time()
+
+    telemetry, placement = _build_fleet_components(config, routing)
+    decision_probe = bool(getattr(config, "FLEET_PLACEMENT_DECISION_PROBE", False))
 
     # Auth server (1812)
     auth_transport, _ = await loop.create_datagram_endpoint(
@@ -277,6 +363,9 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             is_accounting=False,
             acct_timeout_mode=config.ACCT_TIMEOUT_MODE,
             strict_response_verify=config.STRICT_RESPONSE_VERIFY,
+            telemetry=telemetry,
+            placement=placement,
+            decision_probe=decision_probe,
         ),
         local_addr=(config.LISTEN_HOST, config.RADIUS_AUTH_PORT),
     )
@@ -289,13 +378,17 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             is_accounting=True,
             acct_timeout_mode=config.ACCT_TIMEOUT_MODE,
             strict_response_verify=config.STRICT_RESPONSE_VERIFY,
+            telemetry=telemetry,
+            placement=placement,
+            decision_probe=decision_probe,
         ),
         local_addr=(config.LISTEN_HOST, config.RADIUS_ACCT_PORT),
     )
 
     log.info(
-        "RADIUS Proxy started | auth=:%d acct=:%d",
+        "RADIUS Proxy started | auth=:%d acct=:%d | telemetry=%s placement=%s",
         config.RADIUS_AUTH_PORT, config.RADIUS_ACCT_PORT,
+        "on" if telemetry else "off", "on" if placement else "off",
     )
 
     # Initial routing table load
@@ -308,8 +401,28 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             routing.heartbeat(config.PROXY_ID, time.time() - start_time)
             routing.ensure_fresh()
 
+    # Telemetry flush loop — runs the blocking POST (with retry/backoff) off the
+    # event loop in a worker thread so backoff sleeps never stall packet I/O.
+    async def _telemetry_loop():
+        if telemetry is None:
+            return
+        interval = max(1, int(config.FLEET_TELEMETRY_INTERVAL))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await loop.run_in_executor(
+                    None, functools.partial(telemetry.flush, interval=interval)
+                )
+            except Exception as exc:  # pragma: no cover - flush already guards
+                log.debug("telemetry flush loop error (ignored): %s", exc)
+
+    tasks = [asyncio.ensure_future(_maintenance_loop())]
+    if telemetry is not None:
+        tasks.append(asyncio.ensure_future(_telemetry_loop()))
     try:
-        await _maintenance_loop()
+        await asyncio.gather(*tasks)
     finally:
+        for t in tasks:
+            t.cancel()
         auth_transport.close()
         acct_transport.close()
