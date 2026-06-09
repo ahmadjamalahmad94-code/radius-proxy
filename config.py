@@ -28,6 +28,24 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return default
 
 
+def _parse_node_map(raw: str) -> dict[str, str]:
+    """Parse a ``ip=name,ip=name`` CHR-IP → registry-node-name override map.
+
+    Used as a static fallback for telemetry/placement node identity until the
+    panel's routing-table API carries the node name (see contract gap).
+    """
+    out: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        ip, name = pair.split("=", 1)
+        ip, name = ip.strip(), name.strip()
+        if ip and name:
+            out[ip] = name
+    return out
+
+
 def _normalize_acct_timeout_mode(raw: str) -> str:
     """Normalize PROXY_ACCT_TIMEOUT_MODE to its canonical form.
 
@@ -161,3 +179,43 @@ class Config:
         "PROXY_STRICT_RESPONSE_VERIFY",
         _env("PROXY_ENV", "").lower() in ("production", "prod"),
     )
+
+    # ── CHR Fleet: telemetry + placement (Phase 4) ────────────────────────
+    # All proxy → panel fleet calls reuse the X-Proxy-Token HMAC scheme keyed
+    # with RADIUS_PROXY_SHARED_SECRET (PROXY_SHARED_SECRET) — the proxy↔panel
+    # secret, NOT the per-CHR RADIUS secret. Endpoints/identity/secret come from
+    # config/env (never hardcoded).
+
+    # Telemetry (per-node samples → POST /api/proxy/telemetry, contract §1)
+    FLEET_TELEMETRY_ENABLED = _env_bool("PROXY_FLEET_TELEMETRY", True)
+    FLEET_TELEMETRY_ENDPOINT = _env("PROXY_TELEMETRY_ENDPOINT", "") or (
+        ADMIN_BASE_URL.rstrip("/") + "/api/proxy/telemetry"
+    )
+    FLEET_TELEMETRY_INTERVAL = _env_int("PROXY_TELEMETRY_INTERVAL", 30)
+    FLEET_TELEMETRY_TIMEOUT = _env_int("PROXY_TELEMETRY_TIMEOUT", 10)
+    FLEET_TELEMETRY_MAX_RETRIES = _env_int("PROXY_TELEMETRY_MAX_RETRIES", 3)
+    try:
+        FLEET_TELEMETRY_BACKOFF_BASE = float(
+            _env("PROXY_TELEMETRY_BACKOFF_BASE", "0.5") or "0.5"
+        )
+    except ValueError:
+        FLEET_TELEMETRY_BACKOFF_BASE = 0.5
+    FLEET_AGENT_VERSION = _env("PROXY_AGENT_VERSION", "1.0.0")
+
+    # Placement (feedback write → /api/proxy/placement §2;
+    #            decision read → /api/proxy/placement-decision, PROPOSED)
+    FLEET_PLACEMENT_ENABLED = _env_bool("PROXY_FLEET_PLACEMENT", True)
+    FLEET_PLACEMENT_REPORT_ENDPOINT = _env("PROXY_PLACEMENT_ENDPOINT", "") or (
+        ADMIN_BASE_URL.rstrip("/") + "/api/proxy/placement"
+    )
+    FLEET_PLACEMENT_DECISION_ENDPOINT = _env(
+        "PROXY_PLACEMENT_DECISION_ENDPOINT", ""
+    ) or (ADMIN_BASE_URL.rstrip("/") + "/api/proxy/placement-decision")
+    # Read-path decision probe (advisory, log-only in Phase 4).
+    FLEET_PLACEMENT_DECISION_PROBE = _env_bool("PROXY_PLACEMENT_DECISION_PROBE", True)
+    FLEET_PLACEMENT_DECISION_TTL = _env_int("PROXY_PLACEMENT_DECISION_TTL", 30)
+    FLEET_PLACEMENT_TIMEOUT = _env_int("PROXY_PLACEMENT_TIMEOUT", 10)
+
+    # Static CHR-IP → registry node-name map (fallback until routing-table API
+    # carries node names). Format: "203.0.113.11=chr-exit-01,203.0.113.12=chr-exit-02"
+    FLEET_CHR_NODE_MAP = _parse_node_map(_env("PROXY_CHR_NODE_MAP", ""))

@@ -51,6 +51,7 @@ class RoutingTable:
         shared_secret: str,
         refresh_interval: int = 60,
         fail_open_chr: bool = False,
+        static_node_map: Optional[dict[str, str]] = None,
     ):
         self._url = admin_base_url.rstrip("/") + "/api/proxy/routing-table"
         self._chr_nodes_url = admin_base_url.rstrip("/") + "/api/proxy/chr-nodes"
@@ -59,6 +60,12 @@ class RoutingTable:
         self._interval = refresh_interval
         self._routes: dict[str, RouteEntry] = {}
         self._allowed_chr_ips: set[str] = set()
+        # CHR public IP → registry node NAME (when the panel supplies it).
+        # The fleet telemetry/placement layers key by node name; this is the
+        # proxy's IP→name resolver. ``static_node_map`` is a config fallback
+        # until the routing-table API carries names (see Phase-4 contract gap).
+        self._chr_node_names: dict[str, str] = {}
+        self._static_node_map: dict[str, str] = dict(static_node_map or {})
         self._last_refresh: float = 0
         self._fail_open_chr = fail_open_chr
         self._stats = {
@@ -105,13 +112,20 @@ class RoutingTable:
                 )
 
             chr_ips: set[str] = set()
+            chr_names: dict[str, str] = {}
             for n in data.get("chr_nodes", []):
                 ip = str(n.get("public_ip", "")).strip()
                 if ip:
                     chr_ips.add(ip)
+                    # Forward-compatible: pick up a registry name if the panel
+                    # provides one (key "name" or "node"). Absent today; harmless.
+                    name = str(n.get("name") or n.get("node") or "").strip()
+                    if name:
+                        chr_names[ip] = name
 
             self._routes = routes
             self._allowed_chr_ips = chr_ips
+            self._chr_node_names = chr_names
             self._last_refresh = time.time()
             log.info("Routing table refreshed: %d realms, %d CHR nodes", len(routes), len(chr_ips))
             return True
@@ -134,6 +148,23 @@ class RoutingTable:
 
     def all_realms(self) -> list[str]:
         return list(self._routes.keys())
+
+    def node_name_for(self, chr_ip: str) -> Optional[str]:
+        """Resolve a CHR public IP → registry node NAME for fleet telemetry.
+
+        Resolution order: name supplied by the routing-table API, then the
+        static config map, else None (caller falls back to the IP and logs).
+        """
+        return self._chr_node_names.get(chr_ip) or self._static_node_map.get(chr_ip)
+
+    def local_node_candidates(self) -> list[str]:
+        """Best-effort local set of known CHR node names (placement read-path
+        fallback only). The proxy has no health view — that is the panel's job —
+        so this is purely a last-resort hint when the panel is unreachable."""
+        out: list[str] = []
+        for ip in self._allowed_chr_ips:
+            out.append(self.node_name_for(ip) or ip)
+        return out
 
     def is_allowed_chr(self, ip: str) -> bool:
         """Check if this source IP is a known CHR node.
