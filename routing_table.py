@@ -155,7 +155,12 @@ class RoutingTable:
             log.info("Routing table refreshed: %d realms, %d CHR nodes", len(routes), len(chr_ips))
             return True
 
-        except requests.RequestException as exc:
+        except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+            # ValueError/TypeError/KeyError: panel returned 200 with malformed
+            # JSON or wrong-typed fields. refresh() is reached from lookup()
+            # in the packet hot path (ensure_fresh) — it must NEVER raise, or
+            # a bad panel response kills the RADIUS packet task (P10 review).
+            # On failure the previous routing table stays in effect.
             log.error("Failed to refresh routing table: %s", exc)
             return False
 
@@ -278,5 +283,7 @@ class RoutingTable:
                 log.debug("Heartbeat sent OK")
             else:
                 log.warning("Heartbeat returned %s", resp.status_code)
-        except requests.RequestException as exc:
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            # Same never-raise rule as refresh(): heartbeat runs inside the
+            # maintenance loop and must not kill it on a bad panel response.
             log.warning("Heartbeat failed: %s", exc)
