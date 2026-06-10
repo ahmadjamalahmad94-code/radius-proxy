@@ -140,14 +140,12 @@ class RoutingTable:
             self._allowed_chr_ips = chr_ips
             self._chr_node_names = chr_names
             self._node_status = node_status
-            # LIVE-APPLY flag — additive, panel-authoritative. Accept either a
-            # top-level "live_apply" or a nested config block. Default False.
-            self._live_apply = bool(
-                data.get("live_apply",
-                         (data.get("config") or {}).get("live_apply", False))
-            )
-            # Per-user movable opt-in list — additive, forward-compatible
-            # (contract gap: not frozen; absent ⇒ empty ⇒ nobody movable).
+            # LIVE-APPLY flag — panel-authoritative, FROZEN field name
+            # "live_apply_enabled" (contract §1.1). Default False (advisory)
+            # when absent.
+            self._live_apply = bool(data.get("live_apply_enabled", False))
+            # Per-user movable opt-in list — FROZEN field "movable_users"
+            # (lowercased usernames). Absent ⇒ empty ⇒ nobody movable.
             self._movable_users = {
                 str(u).strip().lower()
                 for u in (data.get("movable_users") or [])

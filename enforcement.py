@@ -50,6 +50,18 @@ REASON_SINGLE_SESSION = "manual"      # kill-old is a correctness action
 REASON_REBALANCE      = "rebalance"
 REASON_FAILOVER       = "failover"
 
+# Action vocabulary — FROZEN by the panel enforcement ingest (§1.4):
+#   single_session_kill — kill-old-session (duplicate login on another CHR)
+#   move                — placement move (rebalance / failover)
+#   kick                — plain disconnect (manual / panel-requested)
+ACTION_SINGLE_SESSION_KILL = "single_session_kill"
+ACTION_MOVE                = "move"
+ACTION_KICK                = "kick"
+
+# Results the panel ingest accepts (§1.4). advisory/skipped outcomes stay
+# LOCAL (logged only, never POSTed).
+_REPORTABLE_RESULTS = ("applied", "failed")
+
 
 def _now_iso(ts: Optional[float] = None) -> str:
     dt = (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
@@ -73,15 +85,16 @@ class ActiveSession:
 class EnforcementOutcome:
     """Result of one enforcement evaluation (always produced, for logging/report)."""
 
-    action: str                       # "kill_old" | "move" | "none"
+    action: str                       # single_session_kill | move | kick | "none"
     username: str
     reason: str = ""
     target_node: str = ""             # the node we acted ON (disconnected)
     intended_node: str = ""           # where the user should end up (move)
+    acct_session_id: str = ""         # session the action applied to
     enforced: bool = False            # did we actually send CoA?
     advisory: bool = False            # blocked by live-apply guard?
-    result: str = "skipped"           # applied | rejected | failed | advisory | skipped
-    coa_code: Optional[int] = None
+    result: str = "skipped"           # applied | failed (POSTable) | advisory | skipped (local)
+    coa_code: Optional[int] = None    # local/log only — folded into detail on the wire
     detail: str = ""
 
 
@@ -126,13 +139,15 @@ class SessionTracker:
 
 
 class EnforcementReporter:
-    """POSTs enforcement actions + CoA outcomes to the panel. Never raises.
+    """POSTs enforcement outcomes to the panel ingest (§1.4). Never raises.
 
-    CONTRACT GAP: no enforcement-outcome ingest endpoint is frozen yet (contract
-    §3 says outcomes "flow back via §2 placement ingest"). We therefore POST a
-    clear, self-describing payload to a configurable endpoint AND (for moves) the
-    engine also emits the frozen §2 placement record. Reconcile the endpoint
-    shape with the panel team.
+    FROZEN contract (panel-authoritative):
+      Endpoint : POST /api/proxy/enforcement
+      Action   : single_session_kill | move | kick
+      Result   : applied | failed ONLY — advisory/skipped outcomes are local
+                 (logged, never POSTed; advisory mode sends nothing anyway).
+      Optional : previous_node, reason, acct_session_id, detail.
+    Moves are additionally mirrored via the §2 placement ingest by the engine.
     """
 
     def __init__(
@@ -155,19 +170,37 @@ class EnforcementReporter:
         self._enabled = enabled
 
     def report(self, outcome: EnforcementOutcome, *, ts: Optional[float] = None) -> bool:
-        """POST {proxy_id, node, user, action, result, reason, ts, ...}."""
+        """POST one §1.4 enforcement outcome. Returns True on ok=true ingest."""
         if not self._enabled or not self._endpoint:
             return False
+        # §1.4: only applied|failed are valid ingest results. advisory/skipped
+        # never reach the wire (defense-in-depth — the engine doesn't report
+        # them either).
+        if outcome.result not in _REPORTABLE_RESULTS:
+            log.debug("enforcement report suppressed (result=%s is local-only)",
+                      outcome.result)
+            return False
+        # For a move, `node` is the destination and `previous_node` the source;
+        # for kill/kick, `node` is the CHR we acted on.
+        if outcome.action == ACTION_MOVE:
+            node = outcome.intended_node or outcome.target_node
+            previous_node = outcome.target_node or None
+        else:
+            node = outcome.target_node
+            previous_node = None
+        detail = outcome.detail
+        if outcome.coa_code is not None and outcome.result == "failed":
+            detail = f"{detail} (coa_code={outcome.coa_code})".strip()
         payload = {
             "proxy_id": self._proxy_id,
-            "node": outcome.target_node,
+            "node": node,
             "user": outcome.username,
             "action": outcome.action,
             "result": outcome.result,
             "reason": outcome.reason,
-            "intended_node": outcome.intended_node,
-            "coa_code": outcome.coa_code,
-            "detail": outcome.detail,
+            "previous_node": previous_node,
+            "acct_session_id": outcome.acct_session_id,
+            "detail": detail,
             "ts": _now_iso(ts),
         }
         last: Optional[Exception] = None
@@ -293,8 +326,8 @@ class EnforcementEngine:
                 return EnforcementOutcome(action="none", username=username)
             # User is now live on a different CHR → kill the OLD session.
             return self._disconnect(
-                old, reason=REASON_SINGLE_SESSION, action="kill_old",
-                forced=True, now=now,
+                old, reason=REASON_SINGLE_SESSION,
+                action=ACTION_SINGLE_SESSION_KILL, forced=True, now=now,
             )
         except Exception as exc:  # never break accounting handling
             log.debug("enforcement.on_accounting_start ignored error: %s", exc)
@@ -368,8 +401,10 @@ class EnforcementEngine:
                 log.info("move SKIPPED (movable=false) user=%s %s→%s",
                          sess.username, sess.node_name, intended)
                 return EnforcementOutcome(
-                    action="move", username=sess.username, reason=REASON_REBALANCE,
+                    action=ACTION_MOVE, username=sess.username,
+                    reason=REASON_REBALANCE,
                     target_node=sess.node_name, intended_node=intended,
+                    acct_session_id=sess.acct_session_id,
                     result="skipped", detail="user not movable (opt-in)",
                 )
             return self.enforce_move(
@@ -391,19 +426,39 @@ class EnforcementEngine:
         clock = now if now is not None else time.time()
         if not forced and not self._is_movable(sess.username):
             return EnforcementOutcome(
-                action="move", username=sess.username, reason=reason,
+                action=ACTION_MOVE, username=sess.username, reason=reason,
                 target_node=sess.node_name, intended_node=intended_node,
+                acct_session_id=sess.acct_session_id,
                 result="skipped", detail="user not movable (opt-in)",
             )
         if not self.should_move(sess.username, clock):
             return EnforcementOutcome(
-                action="move", username=sess.username, reason=reason,
+                action=ACTION_MOVE, username=sess.username, reason=reason,
                 target_node=sess.node_name, intended_node=intended_node,
+                acct_session_id=sess.acct_session_id,
                 result="skipped", detail="cooldown (hysteresis)",
             )
         return self._disconnect(
-            sess, reason=reason, action="move", forced=forced,
+            sess, reason=reason, action=ACTION_MOVE, forced=forced,
             intended_node=intended_node, now=clock,
+        )
+
+    def kick_user(
+        self, username: str, *, reason: str = "manual", now: Optional[float] = None,
+    ) -> EnforcementOutcome:
+        """Plain disconnect of a user's current session (§1.4 action `kick`).
+
+        Manual / panel-requested teardown — no placement intent; the client
+        re-resolves the front door and reconnects wherever DNS lands it.
+        """
+        sess = self._tracker.get(username)
+        if sess is None:
+            return EnforcementOutcome(
+                action=ACTION_KICK, username=username, reason=reason,
+                result="skipped", detail="no active session",
+            )
+        return self._disconnect(
+            sess, reason=reason, action=ACTION_KICK, forced=False, now=now,
         )
 
     # ── shared disconnect path (guard + CoA + report) ─────────────────
@@ -421,6 +476,7 @@ class EnforcementEngine:
         out = EnforcementOutcome(
             action=action, username=sess.username, reason=reason,
             target_node=sess.node_name, intended_node=intended_node,
+            acct_session_id=sess.acct_session_id,
         )
 
         # SAFETY GUARD — advisory-only unless the panel enabled live-apply.
@@ -459,7 +515,7 @@ class EnforcementEngine:
 
         if out.result == "applied":
             self._mark_moved(sess.username, clock)
-            if action == "move":
+            if action in (ACTION_MOVE, ACTION_KICK):
                 # The old session is gone; user will reconnect elsewhere.
                 self._tracker.remove(sess.username)
 
@@ -474,7 +530,7 @@ class EnforcementEngine:
             log.debug("enforcement report error (ignored): %s", exc)
         # Frozen §2 channel for moves: realised placement is pending until the
         # user reconnects (then the natural Acct-Start reports reason='new').
-        if out.action == "move" and self._placement is not None and out.enforced:
+        if out.action == ACTION_MOVE and self._placement is not None and out.enforced:
             try:
                 self._placement.report(
                     session_id=sess.acct_session_id, realm=sess.realm,

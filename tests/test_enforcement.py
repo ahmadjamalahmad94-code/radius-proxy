@@ -105,8 +105,9 @@ def test_kill_old_on_reconnect_other_chr():
     assert out1.action == "none" and coa.calls == []
     # … then the SAME user starts on CHR-B → kill the OLD session on CHR-A.
     out2 = eng.on_accounting(_acct(1, "bob@client5", "NEW", "10.77.0.42"), "10.0.0.2")
-    assert out2.action == "kill_old" and out2.result == "applied"
+    assert out2.action == "single_session_kill" and out2.result == "applied"
     assert out2.enforced is True and out2.coa_code == 41
+    assert out2.acct_session_id == "OLD"
     assert len(coa.calls) == 1
     call = coa.calls[0]
     assert call["chr_ip"] == "10.0.0.1"                       # the OLD CHR
@@ -237,7 +238,7 @@ def test_advisory_only_when_live_apply_disabled():
     eng.on_accounting(_acct(1, "bob@client5", "OLD"), "10.0.0.1")
     out = eng.on_accounting(_acct(1, "bob@client5", "NEW"), "10.0.0.2")
     # Intended action computed + logged, NOTHING sent.
-    assert out.action == "kill_old"
+    assert out.action == "single_session_kill"
     assert out.advisory is True and out.result == "advisory"
     assert out.enforced is False
     assert coa.calls == []                         # no CoA traffic at all
@@ -264,9 +265,9 @@ def test_reporter_payload_shape_and_auth():
         max_retries=0,
     )
     out = enf.EnforcementOutcome(
-        action="kill_old", username="bob@client5", reason="manual",
-        target_node="chr-a", intended_node="", enforced=True,
-        result="applied", coa_code=41, detail="",
+        action="single_session_kill", username="bob@client5", reason="manual",
+        target_node="chr-a", intended_node="", acct_session_id="8f2c01",
+        enforced=True, result="applied", coa_code=41, detail="",
     )
 
     class _Resp:
@@ -278,13 +279,54 @@ def test_reporter_payload_shape_and_auth():
     with mock.patch.object(enf.requests, "post", return_value=_Resp()) as post:
         assert rep.report(out, ts=1733740800.0) is True
     body = post.call_args.kwargs["json"]
+    # FROZEN §1.4 shape: action vocabulary + applied|failed + optional
+    # previous_node/reason/acct_session_id/detail. No intended_node/coa_code.
     assert body == {
         "proxy_id": "proxy-01", "node": "chr-a", "user": "bob@client5",
-        "action": "kill_old", "result": "applied", "reason": "manual",
-        "intended_node": "", "coa_code": 41, "detail": "",
+        "action": "single_session_kill", "result": "applied",
+        "reason": "manual", "previous_node": None,
+        "acct_session_id": "8f2c01", "detail": "",
         "ts": "2024-12-09T10:40:00Z",
     }
     assert "X-Proxy-Token" in post.call_args.kwargs["headers"]
+
+
+def test_reporter_move_payload_maps_nodes():
+    rep = enf.EnforcementReporter(
+        endpoint="https://panel.example/api/proxy/enforcement",
+        shared_secret="s", proxy_id="proxy-01", max_retries=0,
+    )
+    out = enf.EnforcementOutcome(
+        action="move", username="bob@client5", reason="failover",
+        target_node="chr-a", intended_node="chr-b", acct_session_id="S1",
+        enforced=True, result="applied",
+    )
+
+    class _Resp:
+        status_code = 200
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    with mock.patch.object(enf.requests, "post", return_value=_Resp()) as post:
+        assert rep.report(out, ts=1733740800.0) is True
+    body = post.call_args.kwargs["json"]
+    assert body["node"] == "chr-b"                 # destination
+    assert body["previous_node"] == "chr-a"        # source
+    assert body["action"] == "move" and body["reason"] == "failover"
+
+
+def test_reporter_suppresses_local_only_results():
+    """advisory/skipped are LOCAL — must never reach the wire (§1.4)."""
+    rep = enf.EnforcementReporter(
+        endpoint="https://panel.example/api/proxy/enforcement",
+        shared_secret="s", proxy_id="p", max_retries=0,
+    )
+    with mock.patch.object(enf.requests, "post") as post:
+        for result in ("advisory", "skipped", "rejected"):
+            out = enf.EnforcementOutcome(action="move", username="u", result=result)
+            assert rep.report(out) is False
+    post.assert_not_called()
 
 
 def test_reporter_retries_with_backoff_and_swallows():
@@ -292,7 +334,7 @@ def test_reporter_retries_with_backoff_and_swallows():
         endpoint="https://panel.example/api/proxy/enforcement",
         shared_secret="s", proxy_id="p", max_retries=2, backoff_base=0.5,
     )
-    out = enf.EnforcementOutcome(action="move", username="u")
+    out = enf.EnforcementOutcome(action="move", username="u", result="failed")
     with mock.patch.object(enf.requests, "post",
                            side_effect=enf.requests.ConnectionError("down")) as post, \
          mock.patch.object(enf.time, "sleep") as sleep:
@@ -321,8 +363,22 @@ def test_kill_old_outcome_reported():
     eng.on_accounting(_acct(1, "bob@client5", "OLD"), "10.0.0.1")
     eng.on_accounting(_acct(1, "bob@client5", "NEW"), "10.0.0.2")
     assert len(rep.outcomes) == 1
-    assert rep.outcomes[0].action == "kill_old"
+    assert rep.outcomes[0].action == "single_session_kill"
     assert rep.outcomes[0].target_node == "chr-a"
+
+
+def test_kick_user_plain_disconnect():
+    coa = FakeCoa()
+    rep = FakeReporter()
+    eng = _engine(coa=coa, reporter=rep)
+    eng.on_accounting(_acct(1, "bob@client5", "S1"), "10.0.0.1")
+    out = eng.kick_user("bob@client5")
+    assert out.action == "kick" and out.result == "applied"
+    assert len(coa.calls) == 1 and coa.calls[0]["chr_ip"] == "10.0.0.1"
+    assert eng._tracker.get("bob@client5") is None     # untracked after kick
+    # No session → skipped, nothing sent.
+    out2 = eng.kick_user("ghost@client5")
+    assert out2.result == "skipped" and len(coa.calls) == 1
 
 
 # ── 7. resilience ─────────────────────────────────────────────────────

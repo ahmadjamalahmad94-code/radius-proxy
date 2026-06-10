@@ -86,6 +86,48 @@ def test_routing_node_resolver_and_candidates():
     assert "chr-exit-01" in cands and "203.0.113.12" in cands
 
 
+def test_routing_refresh_parses_frozen_phase7_fields():
+    """Conformance: panel-frozen field names `live_apply_enabled` +
+    `movable_users` + `chr_nodes[].name/status` parsed from the routing-table."""
+    from unittest import mock
+
+    rt = _routing()
+    data = {
+        "ok": True,
+        "routes": [],
+        "chr_nodes": [
+            {"name": "chr-exit-01", "public_ip": "203.0.113.11", "status": "active"},
+            {"name": "chr-exit-02", "public_ip": "203.0.113.12", "status": "draining"},
+        ],
+        "live_apply_enabled": True,
+        "movable_users": ["Bob@Client5", "alice@client9"],
+    }
+
+    class _Resp:
+        status_code = 200
+        @staticmethod
+        def raise_for_status():
+            pass
+        @staticmethod
+        def json():
+            return data
+
+    with mock.patch.object(rtmod.requests, "get", return_value=_Resp()):
+        assert rt.refresh() is True
+    assert rt.live_apply() is True
+    assert rt.node_name_for("203.0.113.12") == "chr-exit-02"
+    assert rt.is_node_healthy("chr-exit-01") is True
+    assert rt.is_node_healthy("chr-exit-02") is False
+    assert rt.is_user_movable("bob@client5") is True       # lowercased
+    assert rt.is_user_movable("carol@client5") is False
+    # Old (pre-freeze) field name must NOT enable live-apply.
+    data["live_apply_enabled"] = False
+    data["live_apply"] = True
+    with mock.patch.object(rtmod.requests, "get", return_value=_Resp()):
+        assert rt.refresh() is True
+    assert rt.live_apply() is False
+
+
 def test_routing_phase7_accessors_default_safe():
     rt = _routing()
     # Defaults before/without panel data: advisory + no status + nobody movable.

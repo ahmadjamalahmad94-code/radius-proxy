@@ -248,8 +248,8 @@ class Config:
     # How often the rebalance/outage move-evaluation loop runs.
     FLEET_MOVE_EVAL_INTERVAL = _env_int("PROXY_MOVE_EVAL_INTERVAL", 60)
 
-    # Enforcement-outcome ingest (PROPOSED endpoint — see contract gap; outcomes
-    # also flow back via the frozen §2 placement ingest for moves).
+    # Enforcement-outcome ingest (FROZEN §1.4: actions single_session_kill/
+    # move/kick, results applied|failed only; moves also mirror via §2).
     FLEET_ENFORCEMENT_ENDPOINT = _env("PROXY_ENFORCEMENT_ENDPOINT", "") or (
         ADMIN_BASE_URL.rstrip("/") + "/api/proxy/enforcement"
     )
