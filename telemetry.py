@@ -248,7 +248,9 @@ class TelemetryEmitter:
         Returns:
             A list of JSON-serialisable payloads, one per observed node.
         """
-        window = float(interval if interval is not None else self.interval) or 1.0
+        window = float(interval if interval is not None else self.interval)
+        if window <= 0:        # zero/negative window would corrupt the rate
+            window = 1.0
         ts = _now_iso(now)
         payloads: list[dict] = []
         with self._lock:

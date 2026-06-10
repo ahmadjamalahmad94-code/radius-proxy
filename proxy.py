@@ -378,6 +378,9 @@ def _build_fleet_components(
             endpoint=config.FLEET_ENFORCEMENT_ENDPOINT,
             shared_secret=config.PROXY_SHARED_SECRET,
             proxy_id=config.PROXY_ID,
+            timeout=getattr(config, "FLEET_ENFORCEMENT_TIMEOUT", 10),
+            max_retries=getattr(config, "FLEET_ENFORCEMENT_MAX_RETRIES", 2),
+            backoff_base=getattr(config, "FLEET_ENFORCEMENT_BACKOFF_BASE", 0.5),
         )
         # SAFETY GUARD: effective live-apply = panel flag AND local override.
         # Panel flag defaults False when absent/unreachable → advisory-only.

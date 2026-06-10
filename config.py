@@ -19,6 +19,19 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_int_bounded(key: str, default: int, lo: int, hi: int) -> int:
+    """_env_int clamped to [lo, hi] — a typo'd env var (0, negative, or huge)
+    must never produce a non-blocking socket, a div-by-zero window, a busy
+    loop, or an unbounded retry storm (P10 hardening)."""
+    value = _env_int(key, default)
+    if value < lo or value > hi:
+        _LOG.warning(
+            "%s=%r out of bounds [%d, %d] — clamped to %d",
+            key, value, lo, hi, min(max(value, lo), hi),
+        )
+    return min(max(value, lo), hi)
+
+
 def _env_bool(key: str, default: bool = False) -> bool:
     v = os.environ.get(key, "").strip().lower()
     if v in ("1", "true", "yes", "on"):
@@ -191,9 +204,9 @@ class Config:
     FLEET_TELEMETRY_ENDPOINT = _env("PROXY_TELEMETRY_ENDPOINT", "") or (
         ADMIN_BASE_URL.rstrip("/") + "/api/proxy/telemetry"
     )
-    FLEET_TELEMETRY_INTERVAL = _env_int("PROXY_TELEMETRY_INTERVAL", 30)
-    FLEET_TELEMETRY_TIMEOUT = _env_int("PROXY_TELEMETRY_TIMEOUT", 10)
-    FLEET_TELEMETRY_MAX_RETRIES = _env_int("PROXY_TELEMETRY_MAX_RETRIES", 3)
+    FLEET_TELEMETRY_INTERVAL = _env_int_bounded("PROXY_TELEMETRY_INTERVAL", 30, 5, 3600)
+    FLEET_TELEMETRY_TIMEOUT = _env_int_bounded("PROXY_TELEMETRY_TIMEOUT", 10, 1, 60)
+    FLEET_TELEMETRY_MAX_RETRIES = _env_int_bounded("PROXY_TELEMETRY_MAX_RETRIES", 3, 1, 6)
     try:
         FLEET_TELEMETRY_BACKOFF_BASE = float(
             _env("PROXY_TELEMETRY_BACKOFF_BASE", "0.5") or "0.5"
@@ -213,8 +226,8 @@ class Config:
     ) or (ADMIN_BASE_URL.rstrip("/") + "/api/proxy/placement-decision")
     # Read-path decision probe (advisory, log-only in Phase 4).
     FLEET_PLACEMENT_DECISION_PROBE = _env_bool("PROXY_PLACEMENT_DECISION_PROBE", True)
-    FLEET_PLACEMENT_DECISION_TTL = _env_int("PROXY_PLACEMENT_DECISION_TTL", 30)
-    FLEET_PLACEMENT_TIMEOUT = _env_int("PROXY_PLACEMENT_TIMEOUT", 10)
+    FLEET_PLACEMENT_DECISION_TTL = _env_int_bounded("PROXY_PLACEMENT_DECISION_TTL", 30, 1, 3600)
+    FLEET_PLACEMENT_TIMEOUT = _env_int_bounded("PROXY_PLACEMENT_TIMEOUT", 10, 1, 60)
 
     # Static CHR-IP → registry node-name map (fallback until routing-table API
     # carries node names). Format: "203.0.113.11=chr-exit-01,203.0.113.12=chr-exit-02"
@@ -234,22 +247,39 @@ class Config:
     # panel flag defaults False when absent/unreachable).
     FLEET_LIVE_APPLY_ALLOWED = _env_bool("PROXY_LIVE_APPLY_ALLOWED", True)
 
-    # CoA / RFC 5176 sender
-    FLEET_COA_PORT = _env_int("PROXY_COA_PORT", 3799)
-    FLEET_COA_TIMEOUT = _env_int("PROXY_COA_TIMEOUT", 5)
-    FLEET_COA_MAX_RETRIES = _env_int("PROXY_COA_MAX_RETRIES", 2)
+    # CoA / RFC 5176 sender. Bounds (P10): port must be valid; timeout 0 would
+    # make the UDP socket non-blocking (instant failure) → min 1s; retries
+    # capped so a mass failover can't turn into a retransmit storm.
+    FLEET_COA_PORT = _env_int_bounded("PROXY_COA_PORT", 3799, 1, 65535)
+    FLEET_COA_TIMEOUT = _env_int_bounded("PROXY_COA_TIMEOUT", 5, 1, 30)
+    FLEET_COA_MAX_RETRIES = _env_int_bounded("PROXY_COA_MAX_RETRIES", 2, 0, 5)
     try:
         FLEET_COA_BACKOFF_BASE = float(_env("PROXY_COA_BACKOFF_BASE", "0.5") or "0.5")
     except ValueError:
         FLEET_COA_BACKOFF_BASE = 0.5
+    if not (0.0 <= FLEET_COA_BACKOFF_BASE <= 10.0):
+        FLEET_COA_BACKOFF_BASE = 0.5
 
     # Per-user move cooldown (hysteresis) seconds — prevents ping-ponging.
-    FLEET_MOVE_COOLDOWN = _env_int("PROXY_MOVE_COOLDOWN", 120)
-    # How often the rebalance/outage move-evaluation loop runs.
-    FLEET_MOVE_EVAL_INTERVAL = _env_int("PROXY_MOVE_EVAL_INTERVAL", 60)
+    # 0 disables the gate (allowed but discouraged); cap prevents a fat-finger
+    # value from freezing rebalancing for days.
+    FLEET_MOVE_COOLDOWN = _env_int_bounded("PROXY_MOVE_COOLDOWN", 120, 0, 86400)
+    # How often the rebalance/outage move-evaluation loop runs. Min 5s so a
+    # typo can't busy-loop the evaluator.
+    FLEET_MOVE_EVAL_INTERVAL = _env_int_bounded("PROXY_MOVE_EVAL_INTERVAL", 60, 5, 3600)
 
     # Enforcement-outcome ingest (FROZEN §1.4: actions single_session_kill/
     # move/kick, results applied|failed only; moves also mirror via §2).
     FLEET_ENFORCEMENT_ENDPOINT = _env("PROXY_ENFORCEMENT_ENDPOINT", "") or (
         ADMIN_BASE_URL.rstrip("/") + "/api/proxy/enforcement"
     )
+    FLEET_ENFORCEMENT_TIMEOUT = _env_int_bounded("PROXY_ENFORCEMENT_TIMEOUT", 10, 1, 60)
+    FLEET_ENFORCEMENT_MAX_RETRIES = _env_int_bounded("PROXY_ENFORCEMENT_MAX_RETRIES", 2, 0, 5)
+    try:
+        FLEET_ENFORCEMENT_BACKOFF_BASE = float(
+            _env("PROXY_ENFORCEMENT_BACKOFF_BASE", "0.5") or "0.5"
+        )
+    except ValueError:
+        FLEET_ENFORCEMENT_BACKOFF_BASE = 0.5
+    if not (0.0 <= FLEET_ENFORCEMENT_BACKOFF_BASE <= 10.0):
+        FLEET_ENFORCEMENT_BACKOFF_BASE = 0.5
