@@ -219,3 +219,37 @@ class Config:
     # Static CHR-IP → registry node-name map (fallback until routing-table API
     # carries node names). Format: "203.0.113.11=chr-exit-01,203.0.113.12=chr-exit-02"
     FLEET_CHR_NODE_MAP = _parse_node_map(_env("PROXY_CHR_NODE_MAP", ""))
+
+    # ── CHR Fleet: live enforcement / CoA (Phase 7) ───────────────────────
+    # Local master switch for the enforcement engine. When False the engine is
+    # not even constructed (no kill-old / no moves). Default ON, but enforcement
+    # still only ACTS when the PANEL live-apply flag is also enabled (below).
+    FLEET_ENFORCEMENT_ENABLED = _env_bool("PROXY_FLEET_ENFORCEMENT", True)
+
+    # SAFETY GUARD — the panel's authoritative live-apply flag is read from the
+    # routing-table response (RoutingTable.live_apply()). This LOCAL override is
+    # a hard floor: effective_live_apply = panel_flag AND this. Default True
+    # (let the panel decide); set False to hard-disable enforcement locally
+    # regardless of the panel. Either way the safe default is ADVISORY (the
+    # panel flag defaults False when absent/unreachable).
+    FLEET_LIVE_APPLY_ALLOWED = _env_bool("PROXY_LIVE_APPLY_ALLOWED", True)
+
+    # CoA / RFC 5176 sender
+    FLEET_COA_PORT = _env_int("PROXY_COA_PORT", 3799)
+    FLEET_COA_TIMEOUT = _env_int("PROXY_COA_TIMEOUT", 5)
+    FLEET_COA_MAX_RETRIES = _env_int("PROXY_COA_MAX_RETRIES", 2)
+    try:
+        FLEET_COA_BACKOFF_BASE = float(_env("PROXY_COA_BACKOFF_BASE", "0.5") or "0.5")
+    except ValueError:
+        FLEET_COA_BACKOFF_BASE = 0.5
+
+    # Per-user move cooldown (hysteresis) seconds — prevents ping-ponging.
+    FLEET_MOVE_COOLDOWN = _env_int("PROXY_MOVE_COOLDOWN", 120)
+    # How often the rebalance/outage move-evaluation loop runs.
+    FLEET_MOVE_EVAL_INTERVAL = _env_int("PROXY_MOVE_EVAL_INTERVAL", 60)
+
+    # Enforcement-outcome ingest (PROPOSED endpoint — see contract gap; outcomes
+    # also flow back via the frozen §2 placement ingest for moves).
+    FLEET_ENFORCEMENT_ENDPOINT = _env("PROXY_ENFORCEMENT_ENDPOINT", "") or (
+        ADMIN_BASE_URL.rstrip("/") + "/api/proxy/enforcement"
+    )

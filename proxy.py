@@ -28,6 +28,8 @@ from config import Config
 from routing_table import RoutingTable
 from telemetry import TelemetryEmitter
 from placement_hook import PlacementHook
+from coa import CoaSender
+from enforcement import EnforcementEngine, EnforcementReporter, SessionTracker
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,7 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         telemetry: "Optional[TelemetryEmitter]" = None,
         placement: "Optional[PlacementHook]" = None,
         decision_probe: bool = False,
+        enforcement: "Optional[EnforcementEngine]" = None,
     ):
         self._routing = routing
         self._chr_secret = chr_secret
@@ -60,6 +63,9 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         self._telemetry = telemetry
         self._placement = placement
         self._decision_probe = decision_probe
+        # CHR Fleet (Phase 7): enforcement engine — kill-old-session + moves
+        # over CoA. Guard-gated (panel live-apply flag); same never-break rule.
+        self._enforcement = enforcement
         self._transport: Optional[asyncio.DatagramTransport] = None
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
@@ -112,6 +118,20 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
                 self._telemetry.record_from_accounting(pkt, src_ip)
             except Exception as exc:  # pragma: no cover - defensive
                 log.debug("fleet telemetry hook error (ignored): %s", exc)
+
+        # 3c. CHR Fleet enforcement (Phase 7): single-active-session guard.
+        # On Acct-Start the engine tracks the session and — if the user is
+        # already live on ANOTHER CHR — disconnects the OLD one (kill-old,
+        # doc 04 §4.4) so the fixed IP is never live twice. The CoA send is
+        # blocking (UDP + retry/backoff) → offloaded to a worker thread.
+        # Guard-gated inside the engine (advisory when live-apply is off).
+        if self._is_accounting and self._enforcement is not None:
+            try:
+                self._loop.run_in_executor(
+                    None, self._enforcement.on_accounting, pkt, src_ip
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("fleet enforcement hook error (ignored): %s", exc)
 
         # 4. Extract realm and look up route
         realm = pkt.realm
@@ -308,15 +328,16 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
 
 def _build_fleet_components(
     config: type, routing: RoutingTable
-) -> "tuple[Optional[TelemetryEmitter], Optional[PlacementHook]]":
-    """Construct the Phase-4 telemetry emitter + placement hook from config.
+) -> "tuple[Optional[TelemetryEmitter], Optional[PlacementHook], Optional[EnforcementEngine]]":
+    """Construct the Phase-4 telemetry/placement + Phase-7 enforcement from config.
 
-    Both resolve CHR-IP → registry node names via the routing table, and use the
-    proxy↔panel shared secret for X-Proxy-Token auth. Returns (None, None) for a
+    All resolve CHR-IP → registry node names via the routing table, and use the
+    proxy↔panel shared secret for X-Proxy-Token auth. Returns None for a
     component when disabled by config.
     """
     telemetry: Optional[TelemetryEmitter] = None
     placement: Optional[PlacementHook] = None
+    enforcement: Optional[EnforcementEngine] = None
 
     if getattr(config, "FLEET_TELEMETRY_ENABLED", False):
         telemetry = TelemetryEmitter(
@@ -344,7 +365,46 @@ def _build_fleet_components(
             enabled_report=True,
             enabled_decision=config.FLEET_PLACEMENT_DECISION_PROBE,
         )
-    return telemetry, placement
+
+    if getattr(config, "FLEET_ENFORCEMENT_ENABLED", False):
+        coa_sender = CoaSender(
+            chr_secret=config.CHR_SHARED_SECRET,
+            coa_port=config.FLEET_COA_PORT,
+            timeout=config.FLEET_COA_TIMEOUT,
+            max_retries=config.FLEET_COA_MAX_RETRIES,
+            backoff_base=config.FLEET_COA_BACKOFF_BASE,
+        )
+        reporter = EnforcementReporter(
+            endpoint=config.FLEET_ENFORCEMENT_ENDPOINT,
+            shared_secret=config.PROXY_SHARED_SECRET,
+            proxy_id=config.PROXY_ID,
+        )
+        # SAFETY GUARD: effective live-apply = panel flag AND local override.
+        # Panel flag defaults False when absent/unreachable → advisory-only.
+        local_allowed = bool(getattr(config, "FLEET_LIVE_APPLY_ALLOWED", True))
+
+        def _live_apply() -> bool:
+            return local_allowed and routing.live_apply()
+
+        # OUTAGE signal: only trust node status when the panel actually sends
+        # it (otherwise no forced moves — never evacuate on missing data).
+        def _node_healthy(name: str) -> bool:
+            if not routing.has_node_status():
+                return True  # no signal ⇒ assume healthy ⇒ no forced move
+            return routing.is_node_healthy(name)
+
+        enforcement = EnforcementEngine(
+            coa=coa_sender,
+            tracker=SessionTracker(),
+            reporter=reporter,
+            placement=placement,
+            node_resolver=routing.node_name_for,
+            live_apply_provider=_live_apply,
+            node_healthy_provider=_node_healthy,
+            movable_resolver=routing.is_user_movable,
+            move_cooldown=config.FLEET_MOVE_COOLDOWN,
+        )
+    return telemetry, placement, enforcement
 
 
 async def run_proxy(config: type, routing: RoutingTable) -> None:
@@ -352,7 +412,7 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
     loop = asyncio.get_event_loop()
     start_time = time.time()
 
-    telemetry, placement = _build_fleet_components(config, routing)
+    telemetry, placement, enforcement = _build_fleet_components(config, routing)
     decision_probe = bool(getattr(config, "FLEET_PLACEMENT_DECISION_PROBE", False))
 
     # Auth server (1812)
@@ -366,6 +426,7 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             telemetry=telemetry,
             placement=placement,
             decision_probe=decision_probe,
+            enforcement=enforcement,
         ),
         local_addr=(config.LISTEN_HOST, config.RADIUS_AUTH_PORT),
     )
@@ -381,14 +442,17 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             telemetry=telemetry,
             placement=placement,
             decision_probe=decision_probe,
+            enforcement=enforcement,
         ),
         local_addr=(config.LISTEN_HOST, config.RADIUS_ACCT_PORT),
     )
 
     log.info(
-        "RADIUS Proxy started | auth=:%d acct=:%d | telemetry=%s placement=%s",
+        "RADIUS Proxy started | auth=:%d acct=:%d | telemetry=%s placement=%s "
+        "enforcement=%s",
         config.RADIUS_AUTH_PORT, config.RADIUS_ACCT_PORT,
         "on" if telemetry else "off", "on" if placement else "off",
+        "on" if enforcement else "off",
     )
 
     # Initial routing table load
@@ -416,9 +480,26 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             except Exception as exc:  # pragma: no cover - flush already guards
                 log.debug("telemetry flush loop error (ignored): %s", exc)
 
+    # Move-evaluation loop (Phase 7) — scans active sessions for forced
+    # (outage) and opt-in (rebalance) moves. CoA sends are blocking → the
+    # whole evaluation runs in a worker thread. Engine is guard-gated, so with
+    # live-apply off this only logs advisory intentions.
+    async def _enforcement_loop():
+        if enforcement is None:
+            return
+        interval = max(5, int(getattr(config, "FLEET_MOVE_EVAL_INTERVAL", 60)))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await loop.run_in_executor(None, enforcement.evaluate_moves)
+            except Exception as exc:  # pragma: no cover - engine already guards
+                log.debug("enforcement eval loop error (ignored): %s", exc)
+
     tasks = [asyncio.ensure_future(_maintenance_loop())]
     if telemetry is not None:
         tasks.append(asyncio.ensure_future(_telemetry_loop()))
+    if enforcement is not None:
+        tasks.append(asyncio.ensure_future(_enforcement_loop()))
     try:
         await asyncio.gather(*tasks)
     finally:

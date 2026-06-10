@@ -66,6 +66,17 @@ class RoutingTable:
         # until the routing-table API carries names (see Phase-4 contract gap).
         self._chr_node_names: dict[str, str] = {}
         self._static_node_map: dict[str, str] = dict(static_node_map or {})
+        # node NAME → status ("active"|"draining"|"disabled"|...). Drives the
+        # Phase-7 outage signal (status != "active" ⇒ forced move).
+        self._node_status: dict[str, str] = {}
+        # Panel's authoritative LIVE-APPLY flag (Phase 7 safety guard). Default
+        # False (advisory) when the panel doesn't send it / is unreachable.
+        self._live_apply: bool = False
+        # Per-user movable opt-in (Phase 7). Forward-compatible capture of a
+        # top-level "movable_users" list in the routing-table response (contract
+        # gap — not frozen yet). Usernames lowercased. Absent ⇒ empty ⇒ nobody
+        # is movable (safe default: rebalance moves are opt-in).
+        self._movable_users: set[str] = set()
         self._last_refresh: float = 0
         self._fail_open_chr = fail_open_chr
         self._stats = {
@@ -113,19 +124,35 @@ class RoutingTable:
 
             chr_ips: set[str] = set()
             chr_names: dict[str, str] = {}
+            node_status: dict[str, str] = {}
             for n in data.get("chr_nodes", []):
                 ip = str(n.get("public_ip", "")).strip()
+                name = str(n.get("name") or n.get("node") or "").strip()
+                status = str(n.get("status") or "").strip().lower()
                 if ip:
                     chr_ips.add(ip)
-                    # Forward-compatible: pick up a registry name if the panel
-                    # provides one (key "name" or "node"). Absent today; harmless.
-                    name = str(n.get("name") or n.get("node") or "").strip()
                     if name:
                         chr_names[ip] = name
+                if name and status:
+                    node_status[name] = status
 
             self._routes = routes
             self._allowed_chr_ips = chr_ips
             self._chr_node_names = chr_names
+            self._node_status = node_status
+            # LIVE-APPLY flag — additive, panel-authoritative. Accept either a
+            # top-level "live_apply" or a nested config block. Default False.
+            self._live_apply = bool(
+                data.get("live_apply",
+                         (data.get("config") or {}).get("live_apply", False))
+            )
+            # Per-user movable opt-in list — additive, forward-compatible
+            # (contract gap: not frozen; absent ⇒ empty ⇒ nobody movable).
+            self._movable_users = {
+                str(u).strip().lower()
+                for u in (data.get("movable_users") or [])
+                if str(u).strip()
+            }
             self._last_refresh = time.time()
             log.info("Routing table refreshed: %d realms, %d CHR nodes", len(routes), len(chr_ips))
             return True
@@ -165,6 +192,41 @@ class RoutingTable:
         for ip in self._allowed_chr_ips:
             out.append(self.node_name_for(ip) or ip)
         return out
+
+    def live_apply(self) -> bool:
+        """The panel's authoritative LIVE-APPLY flag (Phase 7 safety guard).
+
+        Default False (advisory) when the panel doesn't expose it yet or the
+        last refresh failed — enforcement stays safe until the panel opts in.
+        """
+        return self._live_apply
+
+    def node_status(self, node_name: str) -> Optional[str]:
+        """Lifecycle status for a registry node name, or None if unknown."""
+        return self._node_status.get(node_name)
+
+    def is_node_healthy(self, node_name: str) -> bool:
+        """True iff the node is known and ``status == 'active'``.
+
+        Used as the Phase-7 OUTAGE signal: a session whose CHR is not active
+        (down/draining/disabled/unknown) is force-moved regardless of `movable`.
+        Unknown nodes (absent from the table) are treated as NOT healthy so a
+        removed/dead node triggers evacuation. If the panel sends no status at
+        all, the engine's node_healthy_provider is left unset (no forced moves).
+        """
+        return self._node_status.get(node_name) == "active"
+
+    def has_node_status(self) -> bool:
+        """Whether the panel supplied any node status (gates forced-move logic)."""
+        return bool(self._node_status)
+
+    def is_user_movable(self, username: str) -> bool:
+        """Per-user movable opt-in (Phase 7). Unknown users ⇒ NOT movable.
+
+        Only consulted for CPU/cost rebalance moves; outage failover ignores it
+        (forced for everyone — doc 04 §4.7, doc 05 §5.6.2).
+        """
+        return username.strip().lower() in self._movable_users
 
     def is_allowed_chr(self, ip: str) -> bool:
         """Check if this source IP is a known CHR node.
