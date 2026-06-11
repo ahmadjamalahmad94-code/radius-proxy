@@ -126,13 +126,22 @@ class RoutingTable:
             chr_names: dict[str, str] = {}
             node_status: dict[str, str] = {}
             for n in data.get("chr_nodes", []):
-                ip = str(n.get("public_ip", "")).strip()
+                public_ip = str(n.get("public_ip", "")).strip()
+                # FROZEN field (panel ↔ proxy contract): the CHR's wg-data
+                # address — the source IP the proxy actually sees on UDP
+                # 1812/1813 over wg-data. Without ingesting this the proxy
+                # rejects every real packet with "Packet from unknown CHR
+                # IP …" because public_ip never matches the tunnel source.
+                wg_data_ip = str(n.get("wg_data_ip", "")).strip()
                 name = str(n.get("name") or n.get("node") or "").strip()
                 status = str(n.get("status") or "").strip().lower()
-                if ip:
-                    chr_ips.add(ip)
-                    if name:
-                        chr_names[ip] = name
+                # Both legacy (public-only) and fleet (wg_data_ip-bearing)
+                # entries are accepted; set semantics dedupe overlap.
+                for ip in (public_ip, wg_data_ip):
+                    if ip:
+                        chr_ips.add(ip)
+                        if name:
+                            chr_names[ip] = name
                 if name and status:
                     node_status[name] = status
 
