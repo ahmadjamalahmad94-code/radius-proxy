@@ -213,7 +213,15 @@ ping -c 3 10.98.0.11      # the CHR over the tunnel — must reply
 
 ### 2.5 Adding more CHRs later
 
-One `[Peer]` block per CHR, appended to the same file — only the key + IP change:
+**Recommended: zero-touch sync (no manual `wg set` required).** When
+[§ 2.6 Zero-touch fleet sync](#26-zero-touch-fleet-sync-recommended) is
+configured, you only register the new CHR in the panel — the proxy's
+reconciler picks up the new peer within `PROXY_WG_PEER_SYNC_INTERVAL` (≤60 s
+by default) and applies it to `wg-data` automatically.
+
+**Manual fallback** (if zero-touch is off or you're staging a peer before
+the panel knows about it): one `[Peer]` block per CHR, appended to the
+same file — only the key + IP change:
 
 ```ini
 # ── chr-vpn-2 ─────────────────────────────────────────────
@@ -230,6 +238,80 @@ wg syncconf wg-data <(wg-quick strip wg-data)
 
 (Each new CHR gets the next `10.98.0.x` and is also registered in the panel; the
 panel's onboarding generates the CHR side automatically.)
+
+### 2.6 Zero-touch fleet sync (recommended)
+
+The proxy ships a reconciler (`wg_peer_sync.py`) that polls the panel's
+`GET /api/proxy/wg-peers` endpoint (authenticated with the same
+`X-Proxy-Token` as the routing-table fetch) and IDEMPOTENTLY brings the
+proxy host's `wg-data` peer set in line with the published fleet. This
+eliminates the manual `wg set wg-data peer …` step in § 2.5.
+
+**Contract** — the panel's response (see panel
+`docs/ZERO_TOUCH_SYNC.md`):
+
+```json
+{
+  "peers": [
+    { "name": "chr-vpn-1",
+      "public_key": "<44-char base64 wg-data pubkey>",
+      "allowed_ips": ["10.98.0.11/32"],
+      "endpoint": null }
+  ]
+}
+```
+
+The reconciler enforces these invariants on the proxy side:
+
+| Invariant | How it's enforced |
+|---|---|
+| The interface's PRIVATE key is never read or written by the reconciler. | The code only ever runs `wg show wg-data dump` and `wg set wg-data peer <PUBKEY> {allowed-ips … \| remove}`. The sudoers rule below also pins these two operations. |
+| Only peers the proxy previously added are eligible for removal. | A managed-pubkey state file at `PROXY_WG_STATE_PATH` records what the proxy owns. Peers added by hand (§ 2.5 manual fallback) are NEVER in that set and never removed. |
+| Malformed `public_key` / `allowed_ips` from the panel are skipped. | A strict regex check (44-char base64 pubkey; `/24`–`/32` IPv4 CIDR; refuses `0.0.0.0/0`) runs before any value reaches `wg`. |
+| If the proxy can't invoke `wg`, reconcile is a no-op. | Unprivileged or `wg`-missing → INFO-logs "would add/remove …", returns mode `dry-run`, never raises. Heartbeat + routing-table keep working. |
+
+**One-time privileged setup** (otherwise the reconciler stays in dry-run
+forever and you'll fall back to § 2.5):
+
+```bash
+sudo bash /opt/hobe-radius-proxy/app/systemd/setup-wg-sudoers.sh
+```
+
+That script installs:
+
+- `/etc/sudoers.d/hobe-radius-proxy-wg` — a SCOPED sudoers rule allowing
+  only `wg show wg-data dump`, `wg set wg-data peer * allowed-ips *`, and
+  `wg set wg-data peer * remove`. Nothing else.
+- `/usr/local/sbin/hobe-wg` — a tiny wrapper that `exec`s `sudo -n wg "$@"`.
+- `/var/lib/hobe-radius-proxy/` — the state directory, owned by
+  `hobeproxy`.
+
+Then set in `/etc/hobe-radius-proxy/env`:
+
+```bash
+PROXY_WG_PEER_SYNC_ENABLED=true       # default — leave on
+PROXY_WG_BIN=/usr/local/sbin/hobe-wg  # required after running setup-wg-sudoers.sh
+# PROXY_WG_INTERFACE=wg-data          # default
+# PROXY_WG_STATE_PATH=/var/lib/hobe-radius-proxy/managed-peers.json
+# PROXY_WG_APPLY_MODE=auto             # 'auto'|'apply'|'dry_run' — leave on auto
+# PROXY_WG_PEER_SYNC_INTERVAL=60       # seconds
+```
+
+and restart:
+
+```bash
+systemctl restart radius-proxy
+journalctl -u radius-proxy -f | grep "wg peer sync"
+# expect:
+#   wg peer sync: in sync (N peers, N actual)         ← steady-state line
+#   wg peer sync: add peer chr-vpn-X (10.98.0.X/32)   ← when a CHR is added
+```
+
+If the privileged setup is **not** installed, the reconciler logs once at
+WARNING explaining the fix and then INFO-logs each would-do change every
+cycle. Your CHRs will keep working — you just won't get zero-touch peer
+adds until you fix the privilege; until then, use § 2.5's manual `wg
+syncconf` to add peers.
 
 ---
 
