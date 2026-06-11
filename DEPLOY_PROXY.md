@@ -12,6 +12,57 @@ There are exactly four: the two panel secrets, and the CHR's wg-data public key,
 
 ---
 
+## Scope — what this proxy does, and what it explicitly does NOT
+
+This service is **only** a UDP RADIUS relay + a small panel-facing control
+client. It is NOT in the licensing or integration path.
+
+**The proxy DOES:**
+- Listen on UDP `1812` (Auth) and `1813` (Acct) on the wg-data interface
+  (`10.98.0.1`), accept RADIUS from registered CHRs, re-sign with the per-
+  customer secret, forward to the customer's RADIUS, re-sign the response
+  with the CHR secret, return it.
+- Speak HTTPS **outbound only** to the panel, on these endpoints exclusively
+  (all under `/api/proxy/`):
+  - `GET  /api/proxy/routing-table` — pull realms + CHR allowlist.
+  - `POST /api/proxy/heartbeat` — uptime + stats.
+  - `POST /api/proxy/telemetry` — per-node session/egress samples.
+  - `POST /api/proxy/placement` — §2 placement feedback.
+  - `GET  /api/proxy/placement-decision` — advisory read.
+  - `POST /api/proxy/enforcement` — §1.4 enforcement outcomes.
+  - All authenticated with the proxy's own `X-Proxy-Token` (HMAC-SHA256
+    keyed with `RADIUS_PROXY_SHARED_SECRET`).
+- Send RFC 5176 CoA (Disconnect / Change-of-Authorization) **outbound** to
+  each CHR on UDP 3799 (over wg-data) for kill-old / move.
+
+**The proxy DOES NOT (and MUST never):**
+- Run any inbound HTTP listener. There is no HTTP server in this codebase
+  (`grep -nE 'aiohttp|flask|fastapi|starlette|http\.server' *.py` → empty).
+  The only sockets the proxy opens are the two UDP listeners above plus
+  outbound UDP/HTTPS clients.
+- Touch the **licensing-runtime** path. `radius-module` (the per-customer
+  appliance) talks to the panel directly over HTTPS for `/api/license/*`
+  and licensing checks. The proxy is not a hop.
+- Touch the **integration** path (`/api/integration/*`). Integration calls
+  go radius-module ↔ panel directly. The proxy doesn't see them, doesn't
+  forward them, doesn't proxy them, doesn't observe them.
+- Touch the **backup / bridge** path. Backups flow radius-module ↔ panel
+  (or radius-module ↔ object storage) directly. The proxy is not involved.
+- Hold any customer secret beyond what the panel publishes in
+  `routes[].secret` (per-realm, fetched at refresh). It holds NO license
+  keys, NO integration tokens, NO billing data.
+
+> **Operational consequence.** A `403 Forbidden` on `/api/license/*` or
+> `/api/integration/*` cannot have come from the proxy. The proxy is not a
+> hop on those URLs. Investigate the radius-module ↔ panel path directly.
+
+This is enforced by [`tests/test_proxy_not_in_license_path.py`](tests/test_proxy_not_in_license_path.py):
+the source must contain zero references to `/api/license`, `/api/integration`,
+or backup URLs, and every URL the proxy constructs at runtime must start
+with `/api/proxy/`. If a future change violates this, CI fails.
+
+---
+
 ## 0. Before you start — what you need in hand
 
 | # | Value | Where it comes from |
