@@ -283,3 +283,45 @@ class Config:
         FLEET_ENFORCEMENT_BACKOFF_BASE = 0.5
     if not (0.0 <= FLEET_ENFORCEMENT_BACKOFF_BASE <= 10.0):
         FLEET_ENFORCEMENT_BACKOFF_BASE = 0.5
+
+    # ── Zero-touch fleet sync: wg-data peer reconciler (opt-in) ───────────
+    # Consumes the panel's FROZEN GET /api/proxy/wg-peers endpoint and
+    # idempotently brings the proxy host's `wg-data` peer set in line with
+    # the published fleet. Defaults to ENABLED so onboarding a new CHR in
+    # the panel is zero-touch on the proxy too — but the reconciler is
+    # SAFE-BY-DEFAULT: when the proxy lacks privilege to invoke `wg`, it
+    # logs would-do and never raises (see wg_peer_sync.py).
+    FLEET_WG_PEER_SYNC_ENABLED = _env_bool("PROXY_WG_PEER_SYNC_ENABLED", True)
+    FLEET_WG_PEER_SYNC_ENDPOINT = _env("PROXY_WG_PEER_SYNC_ENDPOINT", "") or (
+        ADMIN_BASE_URL.rstrip("/") + "/api/proxy/wg-peers"
+    )
+    # How often to reconcile. Bounded: a typo can't busy-loop or freeze
+    # the feature for days.
+    FLEET_WG_PEER_SYNC_INTERVAL = _env_int_bounded(
+        "PROXY_WG_PEER_SYNC_INTERVAL", 60, 10, 3600,
+    )
+    FLEET_WG_PEER_SYNC_TIMEOUT = _env_int_bounded(
+        "PROXY_WG_PEER_SYNC_TIMEOUT", 10, 1, 60,
+    )
+    # Interface managed by the reconciler. Must NEVER be the control-plane
+    # `wg-mgmt`; only the data-plane peer set is panel-driven.
+    FLEET_WG_INTERFACE = _env("PROXY_WG_INTERFACE", "wg-data")
+    # Where the proxy persists the list of pubkeys IT has added — the only
+    # peers eligible for later removal. Operator-added peers are never in
+    # this list and never removed.
+    FLEET_WG_STATE_PATH = _env(
+        "PROXY_WG_STATE_PATH",
+        "/var/lib/hobe-radius-proxy/managed-peers.json",
+    )
+    # Executable for `wg`. Override to a small helper (e.g.
+    # /usr/local/sbin/hobe-wg) when the proxy uses a scoped sudoers rule
+    # instead of CAP_NET_ADMIN.
+    FLEET_WG_BIN = _env("PROXY_WG_BIN", "wg")
+    # auto | apply | dry_run. 'auto' tries apply and falls back to dry-run
+    # cleanly on the first permission error. 'dry_run' never calls
+    # `wg set` (audit/observability mode).
+    _apply_mode_raw = _env("PROXY_WG_APPLY_MODE", "auto").lower()
+    FLEET_WG_APPLY_MODE = (
+        _apply_mode_raw if _apply_mode_raw in ("auto", "apply", "dry_run")
+        else "auto"
+    )

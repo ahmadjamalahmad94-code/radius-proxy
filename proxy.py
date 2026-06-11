@@ -30,6 +30,7 @@ from telemetry import TelemetryEmitter
 from placement_hook import PlacementHook
 from coa import CoaSender
 from enforcement import EnforcementEngine, EnforcementReporter, SessionTracker
+from wg_peer_sync import WgPeerSync
 
 log = logging.getLogger(__name__)
 
@@ -410,12 +411,31 @@ def _build_fleet_components(
     return telemetry, placement, enforcement
 
 
+def _build_wg_peer_sync(config: type) -> "Optional[WgPeerSync]":
+    """Construct the zero-touch fleet sync reconciler from config, or None
+    when disabled. Kept separate from ``_build_fleet_components`` so the
+    Phase-4/7 wiring test contract stays a 3-tuple."""
+    if not getattr(config, "FLEET_WG_PEER_SYNC_ENABLED", False):
+        return None
+    return WgPeerSync(
+        admin_base_url=config.ADMIN_BASE_URL,
+        shared_secret=config.PROXY_SHARED_SECRET,
+        interface=config.FLEET_WG_INTERFACE,
+        state_path=config.FLEET_WG_STATE_PATH,
+        wg_path=config.FLEET_WG_BIN,
+        apply_mode=config.FLEET_WG_APPLY_MODE,
+        timeout=config.FLEET_WG_PEER_SYNC_TIMEOUT,
+        enabled=True,
+    )
+
+
 async def run_proxy(config: type, routing: RoutingTable) -> None:
     """Main proxy coroutine — runs Auth + Acct servers + heartbeat loop."""
     loop = asyncio.get_event_loop()
     start_time = time.time()
 
     telemetry, placement, enforcement = _build_fleet_components(config, routing)
+    wg_peer_sync = _build_wg_peer_sync(config)
     decision_probe = bool(getattr(config, "FLEET_PLACEMENT_DECISION_PROBE", False))
 
     # Auth server (1812)
@@ -452,10 +472,11 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
 
     log.info(
         "RADIUS Proxy started | auth=:%d acct=:%d | telemetry=%s placement=%s "
-        "enforcement=%s",
+        "enforcement=%s wg_peer_sync=%s",
         config.RADIUS_AUTH_PORT, config.RADIUS_ACCT_PORT,
         "on" if telemetry else "off", "on" if placement else "off",
         "on" if enforcement else "off",
+        "on" if wg_peer_sync else "off",
     )
 
     # Initial routing table load
@@ -498,11 +519,37 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             except Exception as exc:  # pragma: no cover - engine already guards
                 log.debug("enforcement eval loop error (ignored): %s", exc)
 
+    # Zero-touch fleet sync — periodically reconcile the proxy's wg-data
+    # peer set against the panel's published desired set. Both the HTTP
+    # fetch AND `wg` invocations are blocking → run inside an executor.
+    # The reconciler is internally guarded (reconcile_safe never raises),
+    # so a panel outage or unprivileged proxy never affects heartbeat or
+    # routing-table refresh.
+    async def _wg_peer_sync_loop():
+        if wg_peer_sync is None:
+            return
+        interval = max(
+            10, int(getattr(config, "FLEET_WG_PEER_SYNC_INTERVAL", 60)),
+        )
+        # First pass shortly after startup so a newly-added CHR is picked
+        # up faster than ``interval`` seconds. The maintenance loop already
+        # waits the heartbeat interval before its first iteration, so
+        # this brief lead time doesn't clash with the initial refresh.
+        await asyncio.sleep(min(5, interval))
+        while True:
+            try:
+                await loop.run_in_executor(None, wg_peer_sync.reconcile_safe)
+            except Exception as exc:  # pragma: no cover - reconcile_safe guards
+                log.debug("wg peer sync loop error (ignored): %s", exc)
+            await asyncio.sleep(interval)
+
     tasks = [asyncio.ensure_future(_maintenance_loop())]
     if telemetry is not None:
         tasks.append(asyncio.ensure_future(_telemetry_loop()))
     if enforcement is not None:
         tasks.append(asyncio.ensure_future(_enforcement_loop()))
+    if wg_peer_sync is not None:
+        tasks.append(asyncio.ensure_future(_wg_peer_sync_loop()))
     try:
         await asyncio.gather(*tasks)
     finally:
