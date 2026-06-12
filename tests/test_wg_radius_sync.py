@@ -3,14 +3,17 @@
 Mirrors ``tests/test_wg_peer_sync.py`` (the proven wg-data reconciler) but
 points at:
   * Panel endpoint: ``GET /api/proxy/radius-peers``
-  * JSON top-level key: ``radius_peers`` (NOT ``peers`` — distinct contract)
+  * JSON top-level key: ``peers`` — FROZEN by the cross-repo audit on
+    2026-06-12. The panel deliberately matched the §1421c16 wg-peers
+    shape so both planes share one parser; what disambiguates them is
+    the endpoint_path + interface.
   * WireGuard interface: ``wg-radius`` (NOT ``wg-data``)
   * State file: ``managed-radius-peers.json``
   * Subnet: ``10.200.0.0/16`` per design §1; entries are ``/32`` host routes
 
 The class is the SAME (parametrized) ``WgPeerSync`` — these tests guard
 that the parametrization actually shifted the contract to the new
-endpoint + JSON key + interface, and that the safety model carried over.
+endpoint + interface, and that the safety model carried over.
 """
 from __future__ import annotations
 
@@ -96,7 +99,7 @@ def _new_sync(http_get, runner, *, tmp_path):
     return wps.WgPeerSync(
         "https://panel.example", "proxy-token",
         endpoint_path="/api/proxy/radius-peers",
-        peers_json_key="radius_peers",
+        peers_json_key="peers",
         interface="wg-radius",
         state_path=os.path.join(tmp_path, "managed-radius-peers.json"),
         log_prefix="wg radius sync",
@@ -106,9 +109,9 @@ def _new_sync(http_get, runner, *, tmp_path):
 
 
 def _payload(peers):
-    """The frozen panel contract for radius-peers — top-level
-    ``radius_peers`` (NOT ``peers``)."""
-    return {"ok": True, "radius_peers": peers}
+    """The frozen panel contract for /api/proxy/radius-peers — top-level
+    ``peers`` (deliberately matching the §1421c16 wg-peers shape)."""
+    return {"ok": True, "peers": peers}
 
 
 # ── 1. Contract fields routed correctly ───────────────────────────────
@@ -117,22 +120,19 @@ def _payload(peers):
 def test_endpoint_url_is_api_proxy_radius_peers(tmp_path):
     sync = _new_sync(_http_ok(_payload([])), _Runner(), tmp_path=str(tmp_path))
     assert sync._url.endswith("/api/proxy/radius-peers"), sync._url
-    assert sync._peers_key == "radius_peers"
+    assert sync._peers_key == "peers"
     assert sync._iface == "wg-radius"
 
 
-def test_fetch_reads_radius_peers_key_not_peers(tmp_path):
-    """Critical contract guard: if we accidentally read the wg-data key
-    `peers`, the radius reconciler would silently keep producing zero
-    desired peers and never converge."""
-    # A payload that has BOTH keys — only `radius_peers` is correct here.
+def test_fetch_reads_top_level_peers_key(tmp_path):
+    """Frozen contract guard (cross-repo audit 2026-06-12): the panel's
+    /api/proxy/radius-peers response uses the top-level key ``peers``,
+    NOT ``radius_peers``. If the reconciler read the wrong key it would
+    silently keep producing zero desired peers and wg-radius would
+    never get populated — exactly the bug the audit caught."""
     body = {
         "ok": True,
         "peers": [{
-            "name": "WRONG", "public_key": PK_C12,
-            "allowed_ips": ["10.98.0.99/32"],
-        }],
-        "radius_peers": [{
             "name": "client5", "public_key": PK_C5,
             "allowed_ips": ["10.200.5.2/32"],
         }],
@@ -141,15 +141,14 @@ def test_fetch_reads_radius_peers_key_not_peers(tmp_path):
     peers, _skipped, err = sync._fetch_desired()
     assert err is None
     pubkeys = {p.public_key for p in peers}
-    assert pubkeys == {PK_C5}                    # the radius_peers entry
-    assert PK_C12 not in pubkeys                  # NOT the wg-data 'peers' one
+    assert pubkeys == {PK_C5}
 
 
-def test_bad_json_error_message_mentions_the_radius_peers_key(tmp_path):
-    body = {"ok": True, "radius_peers": "not-a-list"}
+def test_bad_json_error_message_mentions_the_peers_key(tmp_path):
+    body = {"ok": True, "peers": "not-a-list"}
     sync = _new_sync(_http_ok(body), _Runner(), tmp_path=str(tmp_path))
     _peers, _skipped, err = sync._fetch_desired()
-    assert err and "radius_peers" in err
+    assert err and "peers" in err
 
 
 # ── 2. Reconcile: adds, idempotent, stale removal, unprivileged ──────
@@ -274,7 +273,7 @@ def test_build_wg_radius_sync_returns_correctly_parametrized_instance():
     sync = proxymod._build_wg_radius_sync(_CfgRadius)
     assert sync is not None
     assert sync._url.endswith("/api/proxy/radius-peers")
-    assert sync._peers_key == "radius_peers"
+    assert sync._peers_key == "peers"
     assert sync._iface == "wg-radius"
     assert sync._log_prefix == "wg radius sync"
 
@@ -283,3 +282,65 @@ def test_build_returns_none_when_disabled():
     class Off(_CfgRadius):
         FLEET_WG_RADIUS_SYNC_ENABLED = False
     assert proxymod._build_wg_radius_sync(Off) is None
+
+
+# ── 4. CONTRACT REGRESSION (cross-repo audit 2026-06-12) ──────────────
+
+
+def test_fetches_exact_panel_envelope_from_cross_repo_audit(tmp_path):
+    """Regression test for the contract bug the cross-repo audit caught
+    on 2026-06-12: the proxy's wg-radius reconciler was constructed with
+    ``peers_json_key="radius_peers"`` while the panel's actual
+    /api/proxy/radius-peers response uses the top-level key ``peers``
+    (deliberately matching the §1421c16 wg-peers shape so both planes
+    share one parser).
+
+    This test feeds the reconciler the EXACT envelope the panel emits —
+    every top-level field — and asserts it extracts the one peer with
+    the expected ``public_key`` + ``allowed_ips=("10.200.5.2/32",)``.
+    If a future panel change moves the list back under a different key
+    or drops fields from the envelope, this test fails immediately and
+    points at the divergence.
+    """
+    # Exact shape from the cross-repo audit message.
+    panel_envelope = {
+        "ok": True,
+        "generated_at": "2026-06-12T18:42:17Z",
+        "interface": "wg-radius",
+        "listen_port": 51822,
+        "panel_wg_pubkey": "9KLi2c4r0bSdN3kTUfWqXJpZyM8oV6gHA4eCQwBIsYk=",
+        "peer_count": 1,
+        "peers": [
+            {
+                "name": "client5-radius",
+                "public_key": PK_C5,
+                "allowed_ips": ["10.200.5.2/32"],
+                "endpoint": None,
+            },
+        ],
+    }
+    sync = _new_sync(_http_ok(panel_envelope), _Runner(), tmp_path=str(tmp_path))
+    peers, skipped, err = sync._fetch_desired()
+
+    assert err is None, err
+    assert skipped == []
+    assert len(peers) == 1
+    peer = next(iter(peers))
+    assert peer.public_key == PK_C5
+    assert peer.allowed_ips == ("10.200.5.2/32",)
+    assert peer.name == "client5-radius"
+    assert peer.endpoint is None
+
+    # And — the headline acceptance criterion of the audit: reconcile
+    # actually adds the peer (so ``ping 10.200.5.2`` from the proxy
+    # works once the customer side is up). With the previous buggy
+    # ``radius_peers`` key, this set would have been empty and no
+    # ``wg set`` call would have fired.
+    runner = _Runner()
+    sync2 = _new_sync(_http_ok(panel_envelope), runner, tmp_path=str(tmp_path))
+    res = sync2.reconcile()
+    assert res.added == [PK_C5], res
+    assert any(
+        "set" in c and PK_C5 in c and "10.200.5.2/32" in c and "wg-radius" in c
+        for c in runner.calls
+    ), runner.calls

@@ -547,7 +547,14 @@ def _build_wg_radius_sync(config: type) -> "Optional[WgPeerSync]":
         timeout=config.FLEET_WG_RADIUS_SYNC_TIMEOUT,
         enabled=True,
         endpoint_path=config.FLEET_WG_RADIUS_SYNC_ENDPOINT_PATH,
-        peers_json_key="radius_peers",
+        # FROZEN contract (cross-repo audit 2026-06-12): the panel's
+        # /api/proxy/radius-peers response uses the top-level key `peers`
+        # — deliberately matching the §1421c16 wg-peers shape. Per-peer
+        # field names (`public_key`, `allowed_ips`, `name`, `endpoint`)
+        # already match the WgPeerSync parser unchanged. The wg-data and
+        # wg-radius reconcilers therefore BOTH read the default `peers`
+        # — what disambiguates them is the endpoint_path + interface.
+        peers_json_key="peers",
         log_prefix="wg radius sync",
     )
 
