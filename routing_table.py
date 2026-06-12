@@ -28,6 +28,15 @@ _DEFAULT_CHR_SECRET_STATE_PATH = "/var/lib/hobe-radius-proxy/chr-secret.json"
 # during this window the proxy validates Message-Authenticator against
 # BOTH current and previous, so no RADIUS packet is dropped.
 _DEFAULT_CHR_SECRET_GRACE_SECONDS = 86400
+# Default rotation grace window for the per-realm proxy↔customer route
+# secret. The customer's FreeRADIUS converges via heartbeat (≤300s by
+# design); the proxy converges via routing-table refresh (≤60s). During
+# the gap the proxy may send the NEW secret while the customer still has
+# the OLD — upstream silently drops, we see a TIMEOUT. With this grace,
+# the proxy retries the forwarded request signed with the PREVIOUS secret
+# so the customer accepts it. 600s = 5 min margin over the 300s
+# convergence target.
+_DEFAULT_ROUTE_SECRET_GRACE_SECONDS = 600
 
 
 @dataclass
@@ -39,6 +48,12 @@ class RouteEntry:
     acct_port: int
     secret: str
     allowed_chr_ips: list[str] = field(default_factory=list)
+    # §6.2 dual-accept (per-realm route secret rotation grace) — the
+    # previous secret survives in-memory for one rotation window so the
+    # proxy can transparently retry forwarded requests with the previous
+    # value while the customer's FreeRADIUS still has the OLD secret.
+    previous_secret: str = ""
+    secret_rotated_at: float = 0.0
 
     @property
     def auth_addr(self) -> tuple[str, int]:
@@ -68,6 +83,7 @@ class RoutingTable:
         bootstrap_chr_secret: str = "",
         chr_secret_state_path: Optional[str] = None,
         chr_secret_grace_seconds: int = _DEFAULT_CHR_SECRET_GRACE_SECONDS,
+        route_secret_grace_seconds: int = _DEFAULT_ROUTE_SECRET_GRACE_SECONDS,
     ):
         self._url = admin_base_url.rstrip("/") + "/api/proxy/routing-table"
         self._chr_nodes_url = admin_base_url.rstrip("/") + "/api/proxy/chr-nodes"
@@ -115,6 +131,11 @@ class RoutingTable:
             chr_secret_state_path or _DEFAULT_CHR_SECRET_STATE_PATH
         )
         self._chr_secret_grace_seconds = int(chr_secret_grace_seconds)
+        # §6.2 — per-realm route secret rotation grace (PROXY ↔ customer
+        # RADIUS). Mirrors the chr-secret grace, but in-memory only — the
+        # proxy converges in ≤60s and the customer in ≤300s, so a brief
+        # in-memory previous is enough to bridge the gap.
+        self._route_secret_grace_seconds = int(route_secret_grace_seconds)
         self._bootstrap_chr_secret = bootstrap_chr_secret or ""
         self._chr_secret_current: str = ""
         self._chr_secret_previous: str = ""
@@ -148,19 +169,53 @@ class RoutingTable:
                 log.error("Routing table fetch returned ok=false")
                 return False
 
+            # §6.2 — capture the BEFORE state so we can detect per-realm
+            # secret rotations and roll the previous_secret/rotated_at
+            # forward into the new RouteEntry. Without this snapshot the
+            # routes dict overwrite would lose rotation history and
+            # silently break the forward-retry fallback below.
+            old_routes_snapshot = self._routes
+            now = time.time()
             routes: dict[str, RouteEntry] = {}
             for r in data.get("routes", []):
                 realm = str(r.get("realm", "")).strip().lower()
                 if not realm:
                     continue
+                new_secret = str(r.get("secret", ""))
+                old_entry = old_routes_snapshot.get(realm)
+                prev_secret = ""
+                rotated_at = 0.0
+                if old_entry:
+                    if (
+                        new_secret
+                        and old_entry.secret
+                        and new_secret != old_entry.secret
+                    ):
+                        # Rotation detected: demote the old current to
+                        # previous; open the per-realm grace window.
+                        prev_secret = old_entry.secret
+                        rotated_at = now
+                        log.info(
+                            "Route secret rotated for realm '%s' — "
+                            "dual-accept window open for %d s.",
+                            realm, self._route_secret_grace_seconds,
+                        )
+                    else:
+                        # Secret unchanged for this realm: carry forward
+                        # whatever previous/rotated_at we already had
+                        # (still respecting the grace window on read).
+                        prev_secret = old_entry.previous_secret
+                        rotated_at = old_entry.secret_rotated_at
                 routes[realm] = RouteEntry(
                     realm=realm,
                     customer_id=int(r.get("customer_id", 0)),
                     target_ip=str(r.get("target_ip", "")),
                     auth_port=int(r.get("auth_port", 1812)),
                     acct_port=int(r.get("acct_port", 1813)),
-                    secret=str(r.get("secret", "")),
+                    secret=new_secret,
                     allowed_chr_ips=list(r.get("allowed_chr_ips", [])),
+                    previous_secret=prev_secret,
+                    secret_rotated_at=rotated_at,
                 )
 
             chr_ips: set[str] = set()
@@ -329,6 +384,30 @@ class RoutingTable:
             time.time() - self._chr_secret_rotated_at,
         )
         return max(0, remaining)
+
+    def route_previous_secret_in_grace(self, realm: str) -> Optional[str]:
+        """Return the per-realm pre-rotation secret iff still in grace.
+
+        §6.2 dual-accept: when the panel rotates a customer's route
+        secret, the proxy adopts it within ≤60 s (next routing-table
+        refresh) but the customer's FreeRADIUS only catches up after
+        the next bridge heartbeat (≤300 s). In that ~240 s window the
+        proxy's forwarded request — signed with the NEW secret — fails
+        Request-Authenticator at the customer side and the customer
+        silently drops it (the proxy sees a TIMEOUT). With this method
+        the protocol can retry the forward signed with the PREVIOUS
+        secret and the request goes through.
+
+        Returns ``None`` when the realm is unknown, never rotated, or
+        the rotation is older than the grace window.
+        """
+        entry = self._routes.get(realm.lower())
+        if not entry or not entry.previous_secret:
+            return None
+        if (time.time() - entry.secret_rotated_at
+                > self._route_secret_grace_seconds):
+            return None
+        return entry.previous_secret
 
     def chr_secret_fingerprint(self) -> str:
         """Non-reversible fingerprint of (current secret + allowed CHR set).

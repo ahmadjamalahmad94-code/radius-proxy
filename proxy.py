@@ -242,9 +242,48 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         except rp.RadiusError:
             fwd_auth = pkt.authenticator  # should never happen
 
-        # 6. Forward to target RADIUS
+        # 6. Forward to target RADIUS.
         target_addr = route.acct_addr if self._is_accounting else route.auth_addr
         response_data = await self._forward(forwarded, target_addr)
+
+        # 6b. §6.2 — route-secret rotation grace.
+        # The customer's FreeRADIUS converges on a new route secret via
+        # bridge heartbeat (≤300 s by design) while the proxy converges via
+        # routing-table refresh (≤60 s). In the gap, the upstream still has
+        # the OLD secret and silently drops requests we signed with the
+        # NEW secret. Detect that by way of a TIMEOUT, then RETRY ONCE
+        # with the previous secret if the realm is still in grace. The
+        # response (if any) is verified + re-signed back to CHR with the
+        # secret that actually round-tripped — no drops at either end.
+        # The retry is bounded: at most one extra forward per packet, and
+        # only while a rotation is active for that specific realm.
+        upstream_secret = route.secret
+        if response_data is None and not self._is_accounting:
+            prev_route_secret = self._routing.route_previous_secret_in_grace(realm)
+            if prev_route_secret and prev_route_secret != route.secret:
+                try:
+                    forwarded_prev = rp.replace_secret_in_packet(
+                        pkt, chr_secret, prev_route_secret,
+                    )
+                    fwd_auth_prev = rp.parse(forwarded_prev).authenticator
+                except (rp.RadiusError, Exception) as exc:
+                    log.warning(
+                        "Route-secret retry: re-sign with previous failed "
+                        "for realm '%s': %s",
+                        realm, exc,
+                    )
+                else:
+                    log.info(
+                        "Route-secret retry: upstream timed out for realm "
+                        "'%s' — retrying with previous secret (rotation "
+                        "grace).",
+                        realm,
+                    )
+                    retry_data = await self._forward(forwarded_prev, target_addr)
+                    if retry_data is not None:
+                        response_data = retry_data
+                        upstream_secret = prev_route_secret
+                        fwd_auth = fwd_auth_prev
 
         if response_data is None:
             log.warning(
@@ -260,17 +299,20 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
             self._routing.record_request(accepted=False, error=True)
             return
 
-        # 7. Parse and re-sign response for CHR — re-sign with the secret
-        # that validated this request. During rotation grace, this can be
-        # the PREVIOUS secret; the CHR will then verify the Response-
-        # Authenticator with the same secret it used to sign the request,
-        # so no packet is dropped on either side.
+        # 7. Parse and re-sign response for CHR.
+        # We verify the upstream response with the SAME secret that
+        # round-tripped (current OR previous, depending on §6.2 retry
+        # above). We re-sign for the CHR with the secret that validated
+        # the original request (current OR previous, depending on §6.1).
+        # Both halves of the dual-accept window collapse to "use whichever
+        # secret actually worked on the wire" — never drop a packet over
+        # an in-flight rotation.
         try:
             resp_pkt = rp.parse(response_data)
             rebuilt = rp.rebuild_response(
                 resp_pkt,
                 request_auth=pkt.authenticator,             # original CHR authenticator
-                old_secret=route.secret,
+                old_secret=upstream_secret,
                 new_secret=chr_secret,
                 verify_auth=fwd_auth,                       # forwarded authenticator (differs for accounting)
                 strict_verify=self._strict_response_verify, # drop on mismatch in production
