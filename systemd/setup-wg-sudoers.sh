@@ -57,14 +57,22 @@ trap 'rm -f "$TMP"' EXIT
 cat > "$TMP" <<EOF
 # Installed by setup-wg-sudoers.sh — DO NOT EDIT.
 # Grants the radius-proxy service user the minimum 'wg' invocations
-# required by the zero-touch peer sync reconciler. Nothing else.
+# required by the zero-touch peer sync reconcilers — both the wg-data
+# (CHR ↔ proxy) and wg-radius (customer ↔ proxy) interfaces. Nothing else.
 
-Cmnd_Alias HOBE_WG_SHOW = $WG_BIN show wg-data dump
-Cmnd_Alias HOBE_WG_SET  = $WG_BIN set wg-data peer * allowed-ips *, \\
-                          $WG_BIN set wg-data peer * remove
+# wg-data — CHR fleet plane (existing).
+Cmnd_Alias HOBE_WG_SHOW_DATA = $WG_BIN show wg-data dump
+Cmnd_Alias HOBE_WG_SET_DATA  = $WG_BIN set wg-data peer * allowed-ips *, \\
+                               $WG_BIN set wg-data peer * remove
 
-$SERVICE_USER ALL=(root) NOPASSWD: HOBE_WG_SHOW, HOBE_WG_SET
-Defaults!HOBE_WG_SHOW,HOBE_WG_SET !requiretty
+# wg-radius — customer RADIUS plane (new, design §4.2).
+Cmnd_Alias HOBE_WG_SHOW_RADIUS = $WG_BIN show wg-radius dump
+Cmnd_Alias HOBE_WG_SET_RADIUS  = $WG_BIN set wg-radius peer * allowed-ips *, \\
+                                 $WG_BIN set wg-radius peer * remove
+
+$SERVICE_USER ALL=(root) NOPASSWD: HOBE_WG_SHOW_DATA, HOBE_WG_SET_DATA, \\
+                                   HOBE_WG_SHOW_RADIUS, HOBE_WG_SET_RADIUS
+Defaults!HOBE_WG_SHOW_DATA,HOBE_WG_SET_DATA,HOBE_WG_SHOW_RADIUS,HOBE_WG_SET_RADIUS !requiretty
 EOF
 
 # Validate before installing (visudo -c -f).

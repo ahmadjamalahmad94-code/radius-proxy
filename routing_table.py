@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -16,6 +18,16 @@ from typing import Optional
 import requests
 
 log = logging.getLogger(__name__)
+
+
+# Default location for the 0600 state file that persists the CHR shared
+# secret across restarts. Matches DEPLOY_PROXY.md / state-dir convention.
+_DEFAULT_CHR_SECRET_STATE_PATH = "/var/lib/hobe-radius-proxy/chr-secret.json"
+# Default rotation grace window for dual-accept. 24h gives the operator
+# time to re-import all CHR scripts after the panel rotates the secret —
+# during this window the proxy validates Message-Authenticator against
+# BOTH current and previous, so no RADIUS packet is dropped.
+_DEFAULT_CHR_SECRET_GRACE_SECONDS = 86400
 
 
 @dataclass
@@ -52,6 +64,10 @@ class RoutingTable:
         refresh_interval: int = 60,
         fail_open_chr: bool = False,
         static_node_map: Optional[dict[str, str]] = None,
+        *,
+        bootstrap_chr_secret: str = "",
+        chr_secret_state_path: Optional[str] = None,
+        chr_secret_grace_seconds: int = _DEFAULT_CHR_SECRET_GRACE_SECONDS,
     ):
         self._url = admin_base_url.rstrip("/") + "/api/proxy/routing-table"
         self._chr_nodes_url = admin_base_url.rstrip("/") + "/api/proxy/chr-nodes"
@@ -86,6 +102,31 @@ class RoutingTable:
             "requests_error": 0,
             "realms_not_found": set(),
         }
+
+        # ── §6.1 CHR shared secret — panel-canonical, env demoted to bootstrap ─
+        # The owner's manual-secret-matching pain came from two hand-managed
+        # copies of CHR_SHARED_SECRET drifting (64-char panel vs 34-char env).
+        # Eliminated by construction: the panel includes `chr_shared_secret`
+        # in the authenticated routing-table response; the relay reads it
+        # PER PACKET via chr_secret() / previous_chr_secret_in_grace(). The
+        # bootstrap_chr_secret is the env value, used ONLY before the first
+        # successful fetch (or when the panel didn't send the field).
+        self._chr_secret_state_path = (
+            chr_secret_state_path or _DEFAULT_CHR_SECRET_STATE_PATH
+        )
+        self._chr_secret_grace_seconds = int(chr_secret_grace_seconds)
+        self._bootstrap_chr_secret = bootstrap_chr_secret or ""
+        self._chr_secret_current: str = ""
+        self._chr_secret_previous: str = ""
+        self._chr_secret_rotated_at: float = 0.0
+        # one-shot warning when the bootstrap env differs from the panel value
+        self._chr_secret_env_warned = False
+        # Load any persisted state FIRST (survives restart during a panel
+        # outage), then fall back to the bootstrap env. The panel's next
+        # refresh() takes over from there.
+        self._load_chr_secret_state()
+        if not self._chr_secret_current and self._bootstrap_chr_secret:
+            self._chr_secret_current = self._bootstrap_chr_secret
 
     def _make_token(self) -> str:
         ts = int(time.time())
@@ -160,6 +201,16 @@ class RoutingTable:
                 for u in (data.get("movable_users") or [])
                 if str(u).strip()
             }
+            # ── §6.1 CHR shared secret ingestion ──────────────────────────
+            # Frozen field: data["chr_shared_secret"]. The owner's
+            # manual-secret-matching pain is eliminated by construction —
+            # the proxy's relay reads this value PER PACKET, so panel and
+            # proxy can never drift again. Empty / absent ⇒ keep current
+            # (don't poison state with an empty when the panel hasn't
+            # configured the secret yet).
+            panel_secret = str(data.get("chr_shared_secret") or "")
+            if panel_secret:
+                self._adopt_chr_secret(panel_secret)
             self._last_refresh = time.time()
             log.info("Routing table refreshed: %d realms, %d CHR nodes", len(routes), len(chr_ips))
             return True
@@ -240,6 +291,161 @@ class RoutingTable:
         """
         return username.strip().lower() in self._movable_users
 
+    # ── §6.1 CHR shared secret — panel-canonical, per-packet, dual-accept ──
+
+    def chr_secret(self) -> str:
+        """Currently effective CHR shared secret.
+
+        Source of truth: the panel's authenticated routing-table response
+        (``data["chr_shared_secret"]``), persisted to a 0600 state file so
+        the proxy keeps relaying across restarts during a panel outage.
+        Returns the bootstrap env value (``PROXY_CHR_SECRET``) only when
+        the panel has not yet supplied one — once the panel ships a value,
+        it permanently overrides.
+        """
+        return self._chr_secret_current
+
+    def previous_chr_secret_in_grace(self) -> Optional[str]:
+        """The pre-rotation secret while still inside the grace window.
+
+        Returns ``None`` when there is no previous secret OR the rotation
+        is older than ``chr_secret_grace_seconds``. The dual-accept logic
+        in the protocol uses this to validate Message-Authenticator
+        against BOTH secrets during rotation, so no RADIUS packet drops
+        while CHRs re-import scripts.
+        """
+        if not self._chr_secret_previous:
+            return None
+        if (time.time() - self._chr_secret_rotated_at
+                > self._chr_secret_grace_seconds):
+            return None
+        return self._chr_secret_previous
+
+    def chr_secret_in_grace_remaining(self) -> int:
+        """Seconds left in the dual-accept window (0 when not rotating)."""
+        if not self._chr_secret_previous:
+            return 0
+        remaining = self._chr_secret_grace_seconds - int(
+            time.time() - self._chr_secret_rotated_at,
+        )
+        return max(0, remaining)
+
+    def chr_secret_fingerprint(self) -> str:
+        """Non-reversible fingerprint of (current secret + allowed CHR set).
+
+        Reported to the panel in heartbeats so the panel can detect drift
+        (§6.4). NEVER logs the secret itself — only a 16-hex-char digest.
+        """
+        h = hashlib.sha256()
+        h.update(self._chr_secret_current.encode())
+        h.update(b"|")
+        h.update("|".join(sorted(self._allowed_chr_ips)).encode())
+        return h.hexdigest()[:16]
+
+    def _adopt_chr_secret(self, panel_secret: str) -> None:
+        """Install a new panel-published secret, demoting the current one
+        to ``previous`` if it differs (starts the dual-accept window).
+        Persists to the 0600 state file on every change. NEVER logs the
+        secret value itself.
+        """
+        if panel_secret == self._chr_secret_current:
+            # No-op: panel still publishing the value we already have.
+            # One-shot env-deprecation warning still fires if env differs.
+            self._maybe_warn_env_drift(panel_secret)
+            return
+        if self._chr_secret_current:
+            self._chr_secret_previous = self._chr_secret_current
+            self._chr_secret_rotated_at = time.time()
+            log.info(
+                "CHR shared secret rotated by panel — dual-accept window "
+                "open for %d s (no RADIUS drops while CHRs re-import).",
+                self._chr_secret_grace_seconds,
+            )
+        else:
+            log.info("CHR shared secret loaded from panel (first acquisition).")
+        self._chr_secret_current = panel_secret
+        self._save_chr_secret_state()
+        self._maybe_warn_env_drift(panel_secret)
+
+    def _maybe_warn_env_drift(self, panel_secret: str) -> None:
+        """ONE-shot warning when bootstrap env differs from panel value.
+        The owner's incident was hand-managed env (34 chars) drifting from
+        the panel (64 chars). With panel-canonical secrets this can never
+        cause a RADIUS drop again — but we still flag it so the operator
+        can clean up the stale env.
+        """
+        if (
+            self._bootstrap_chr_secret
+            and self._bootstrap_chr_secret != panel_secret
+            and not self._chr_secret_env_warned
+        ):
+            log.warning(
+                "PROXY_CHR_SECRET env value differs from the panel's "
+                "authoritative chr_shared_secret — adopting the PANEL value "
+                "(env is now bootstrap-only; remove it from /etc/hobe-"
+                "radius-proxy/env to silence this warning). No RADIUS "
+                "packets are at risk.",
+            )
+            self._chr_secret_env_warned = True
+
+    def _load_chr_secret_state(self) -> None:
+        """Best-effort load of the persisted CHR-secret state. Silent on
+        first-run / unreadable / malformed — falls back to bootstrap env."""
+        try:
+            with open(self._chr_secret_state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        self._chr_secret_current = str(data.get("current") or "")
+        self._chr_secret_previous = str(data.get("previous") or "")
+        try:
+            self._chr_secret_rotated_at = float(data.get("rotated_at_unix") or 0.0)
+        except (TypeError, ValueError):
+            self._chr_secret_rotated_at = 0.0
+
+    def _save_chr_secret_state(self) -> None:
+        """Persist (current, previous, rotated_at) atomically at 0600.
+
+        Failure to persist is non-fatal: the relay keeps working with the
+        in-memory state; the next refresh will retry. NEVER logs the
+        secret values themselves.
+        """
+        try:
+            parent = os.path.dirname(self._chr_secret_state_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = self._chr_secret_state_path + ".tmp"
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "current": self._chr_secret_current,
+                        "previous": self._chr_secret_previous,
+                        "rotated_at_unix": self._chr_secret_rotated_at,
+                    }, f)
+            except Exception:
+                # fdopen took ownership; if write blew up we still need to
+                # remove the partial tmp file before re-raising.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, self._chr_secret_state_path)
+            # `os.replace` preserves the mode set at open() time.
+        except OSError as exc:
+            log.warning(
+                "CHR secret state save to %s failed: %s "
+                "(relay continues; next refresh retries)",
+                self._chr_secret_state_path, exc,
+            )
+
     def is_allowed_chr(self, ip: str) -> bool:
         """Check if this source IP is a known CHR node.
 
@@ -285,6 +491,14 @@ class RoutingTable:
                 "requests_error": self._stats["requests_error"],
                 "active_realms": list(self._routes.keys()),
                 "realms_not_found": list(self._stats["realms_not_found"]),
+                # §6.4 drift visibility: the panel compares this against
+                # what it published and surfaces a single boolean per
+                # party (سنخرى ✓ / بانتظار التقارب…). Non-reversible —
+                # the secret itself never leaves the proxy.
+                "config_fingerprint": self.chr_secret_fingerprint(),
+                "chr_secret_grace_remaining_s": (
+                    self.chr_secret_in_grace_remaining()
+                ),
             }
             resp = requests.post(self._heartbeat_url, json=payload, headers=self._headers(), timeout=10)
             if resp.ok:

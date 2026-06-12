@@ -315,6 +315,158 @@ syncconf` to add peers.
 
 ---
 
+## 2bis. Customer RADIUS tunnel (`wg-radius`)
+
+The proxy now manages a SECOND WireGuard interface for the customer-RADIUS
+plane (design `CUSTOMER_RADIUS_TUNNEL_DESIGN.md` §1, §4). Customer
+`radius-module` instances dial in to `proxy.hoberadius.com:51822`, get the
+deterministic address `10.200.<customer_id>.2/32` inside the tunnel, and the
+proxy forwards RADIUS to them through the tunnel — replacing the
+public-internet hop that used to time out.
+
+The proxy's peer set on this interface is panel-driven through the
+**same** reconciler class as §2.6, fetching `GET /api/proxy/radius-peers`
+instead of `wg-peers` and acting on `wg-radius` instead of `wg-data`.
+Inherits the full safety model verbatim (safe-by-default dry-run when
+unprivileged, never touches operator-added peers, never raises).
+
+### 2bis.1 Generate the proxy wg-radius keypair (once)
+
+```bash
+umask 077
+wg genkey | tee /etc/wireguard/wg-radius.privkey | wg pubkey > /etc/wireguard/wg-radius.pubkey
+cat /etc/wireguard/wg-radius.pubkey     # ← paste THIS into the panel below
+```
+
+### 2bis.2 Bring the interface up
+
+```bash
+cat > /etc/wireguard/wg-radius.conf <<'EOF'
+[Interface]
+PrivateKey = __PASTE_CONTENTS_OF /etc/wireguard/wg-radius.privkey__
+Address    = 10.200.0.1/16
+ListenPort = 51822
+
+# No static [Peer] blocks here — the reconciler owns this interface.
+# Add peers manually only for staging; the next reconcile will keep them
+# if the panel publishes the matching pubkey.
+EOF
+
+sed -i "s|__PASTE_CONTENTS_OF /etc/wireguard/wg-radius.privkey__|$(cat /etc/wireguard/wg-radius.privkey)|" /etc/wireguard/wg-radius.conf
+chmod 600 /etc/wireguard/wg-radius.conf
+
+wg-quick up wg-radius
+systemctl enable wg-quick@wg-radius
+ip -br addr show wg-radius
+# expect: wg-radius UNKNOWN 10.200.0.1/16
+```
+
+`Address 10.200.0.1/16` installs the route for the whole 10.200/16 plane,
+so `proxy.py` forwarding to `10.200.<id>.2:1812` Just Works — no
+forwarding-code change is needed beyond the routing table the OS now has.
+
+### 2bis.3 Open UFW + extend sudoers
+
+If you ran `setup-ufw.sh` already, re-run it — the updated script adds
+`allow 51822/udp` automatically:
+
+```bash
+bash /opt/hobe-radius-proxy/app/systemd/setup-ufw.sh
+```
+
+If you ran `setup-wg-sudoers.sh` already, re-run it — the updated script
+extends the scoped sudoers rule to cover `wg show wg-radius dump` and
+`wg set wg-radius peer * {allowed-ips * | remove}`:
+
+```bash
+bash /opt/hobe-radius-proxy/app/systemd/setup-wg-sudoers.sh
+```
+
+### 2bis.4 Tell the panel about the proxy's wg-radius identity
+
+Open the panel infra page (the SAME page where you pasted the wg-data
+pubkey in §3) and enter:
+
+| Panel Setting | Value |
+|---|---|
+| `PROXY_RADIUS_WG_PUBKEY` | output of `cat /etc/wireguard/wg-radius.pubkey` (step 2bis.1) |
+| `PROXY_RADIUS_WG_ENDPOINT` | `proxy.hoberadius.com:51822` |
+| `PROXY_RADIUS_WG_TUNNEL_IP` | `10.200.0.1` |
+
+These are the values the panel hands down to every customer's
+`radius-module` heartbeat response (design §3.2 `radius_tunnel` block).
+
+### 2bis.5 What you should see in logs
+
+Within `PROXY_WG_RADIUS_SYNC_INTERVAL` (default 60 s) after the panel
+publishes a customer's wg pubkey:
+
+```
+INFO  wg radius sync: add peer client5-radius (10.200.5.2/32)
+INFO  wg radius sync: in sync (1 peers, 1 actual)
+```
+
+And then RADIUS forwarding to `10.200.5.2` (configured per-realm in the
+routing-table) reaches the customer through the tunnel.
+
+### 2bis.6 Env knobs (already defaults in `/etc/hobe-radius-proxy/env`)
+
+```bash
+# PROXY_WG_RADIUS_SYNC_ENABLED=true        # default
+# PROXY_WG_RADIUS_INTERFACE=wg-radius      # default
+# PROXY_WG_RADIUS_STATE_PATH=/var/lib/hobe-radius-proxy/managed-radius-peers.json
+# PROXY_WG_RADIUS_SYNC_INTERVAL=60         # seconds
+# PROXY_WG_RADIUS_SYNC_TIMEOUT=10          # seconds
+```
+
+---
+
+## 2ter. Automatic CHR secret sync (§6.1 — kills the manual-matching pain)
+
+The owner's #1 rule (`CUSTOMER_RADIUS_TUNNEL_DESIGN.md` § HEADLINE):
+**no operator ever compares two secrets by eye.**
+
+What this proxy now does, automatically and on every routing-table refresh:
+
+1. **Reads `chr_shared_secret` from the authenticated routing-table** —
+   the SAME panel field that's baked into every CHR script. The relay
+   uses it PER PACKET (not a frozen constructor value), so panel and
+   proxy cannot drift.
+2. **Demotes `PROXY_CHR_SECRET` to bootstrap-only** — used solely before
+   the first successful routing-table fetch. On any difference between
+   the env and the panel value, the proxy logs ONE warning ("adopting
+   panel value; remove env to silence") and uses the panel's value.
+3. **Persists the last-known secret to a 0600 state file** at
+   `/var/lib/hobe-radius-proxy/chr-secret.json` so a proxy restart
+   during a panel outage keeps relaying RADIUS without interruption.
+4. **Dual-accept rotation window** of 24 h (`PROXY_CHR_SECRET_GRACE_SECONDS`)
+   — when the panel rotates the secret, inbound Message-Authenticator is
+   validated against current AND previous; the response is signed with
+   whichever secret validated. NO RADIUS packet is dropped while CHRs
+   re-import scripts at the operator's pace.
+5. **Reports `config_fingerprint` to the panel** in every heartbeat so
+   the panel can show a green ✓ on the proxy page (§6.4 drift visibility).
+
+There is nothing for the operator to configure here — it just works the
+moment the panel ships `chr_shared_secret` in the routing-table response.
+If you have `PROXY_CHR_SECRET` in `/etc/hobe-radius-proxy/env`, you can
+leave it (it's the bootstrap fallback) or remove it after one warning-
+free hour — the panel's value will keep working either way.
+
+State files involved:
+
+```bash
+ls -l /var/lib/hobe-radius-proxy/
+# -rw-------  hobeproxy  chr-secret.json              (mode 0600, persisted secret)
+# -rw-------  hobeproxy  managed-peers.json           (wg-data managed pubkeys)
+# -rw-------  hobeproxy  managed-radius-peers.json    (wg-radius managed pubkeys)
+```
+
+`setup-wg-sudoers.sh` already ensures `/var/lib/hobe-radius-proxy/`
+exists with the right ownership.
+
+---
+
 ## 3. Give the panel its two values
 
 Open the panel: **«إعدادات البنية → وكيل RADIUS المركزي»** and enter:
