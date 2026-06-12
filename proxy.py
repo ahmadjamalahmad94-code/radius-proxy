@@ -29,6 +29,7 @@ from routing_table import RoutingTable
 from telemetry import TelemetryEmitter
 from placement_hook import PlacementHook
 from coa import CoaSender
+from coa_executor import CoaExecutor
 from enforcement import EnforcementEngine, EnforcementReporter, SessionTracker
 from wg_peer_sync import WgPeerSync
 
@@ -559,6 +560,62 @@ def _build_wg_radius_sync(config: type) -> "Optional[WgPeerSync]":
     )
 
 
+def _build_coa_executor(
+    config: type, routing: RoutingTable,
+    enforcement: "Optional[EnforcementEngine]",
+) -> "Optional[CoaExecutor]":
+    """Construct the panel-queued CoA / Disconnect executor.
+
+    Returns None when disabled. The executor needs a way to map a realm
+    (and optional ``target_node_id``) to live (chr_ip, username,
+    acct_session_id) triples; production wires this through the
+    enforcement engine's SessionTracker. When enforcement is off, the
+    executor still runs — it will simply report ``no_active_sessions``
+    for every realm (which is "done" with that detail string, so the
+    panel cleanly dequeues).
+    """
+    if not getattr(config, "COA_EXECUTOR_ENABLED", False):
+        return None
+    # Best-effort session resolution. We deliberately avoid changing the
+    # enforcement public API and reach into the engine's tracker — it's
+    # already exposed for the Phase-7 integration tests, and the alternative
+    # (a parallel SessionTracker fed off the same packet stream) would
+    # double the bookkeeping. Falls back to "no targets" when enforcement
+    # is disabled — callers see a clean 'done/no_active_sessions_for_realm'.
+    tracker = getattr(enforcement, "_tracker", None) if enforcement else None
+
+    def _targets_for(realm: str, _target_node_id):
+        if tracker is None:
+            return []
+        out: list[tuple[str, str, str]] = []
+        for sess in tracker.snapshot():
+            # Filter by realm — usernames are user@realm in the proxy's
+            # data model (the routing-table lookup uses the same split).
+            uname = sess.username or ""
+            if "@" not in uname:
+                continue
+            user_realm = uname.split("@", 1)[1].strip().lower()
+            if user_realm != realm.strip().lower():
+                continue
+            out.append((sess.chr_ip, uname, sess.acct_session_id))
+        return out
+
+    return CoaExecutor(
+        routing=routing,
+        targets_provider=_targets_for,
+        result_endpoint=config.COA_RESULT_ENDPOINT,
+        shared_secret=config.PROXY_SHARED_SECRET,
+        coa_port=config.FLEET_COA_PORT,
+        coa_timeout=config.FLEET_COA_TIMEOUT,
+        coa_max_retries=config.FLEET_COA_MAX_RETRIES,
+        coa_backoff_base=config.FLEET_COA_BACKOFF_BASE,
+        result_timeout=config.COA_RESULT_TIMEOUT,
+        state_path=config.COA_EXECUTED_STATE_PATH,
+        max_executed_ids=config.COA_EXECUTED_MAX_IDS,
+        enabled=True,
+    )
+
+
 async def run_proxy(config: type, routing: RoutingTable) -> None:
     """Main proxy coroutine — runs Auth + Acct servers + heartbeat loop."""
     loop = asyncio.get_event_loop()
@@ -567,6 +624,7 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
     telemetry, placement, enforcement = _build_fleet_components(config, routing)
     wg_peer_sync = _build_wg_peer_sync(config)
     wg_radius_sync = _build_wg_radius_sync(config)
+    coa_executor = _build_coa_executor(config, routing, enforcement)
     decision_probe = bool(getattr(config, "FLEET_PLACEMENT_DECISION_PROBE", False))
 
     # Auth server (1812)
@@ -603,12 +661,13 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
 
     log.info(
         "RADIUS Proxy started | auth=:%d acct=:%d | telemetry=%s placement=%s "
-        "enforcement=%s wg_peer_sync=%s wg_radius_sync=%s",
+        "enforcement=%s wg_peer_sync=%s wg_radius_sync=%s coa_executor=%s",
         config.RADIUS_AUTH_PORT, config.RADIUS_ACCT_PORT,
         "on" if telemetry else "off", "on" if placement else "off",
         "on" if enforcement else "off",
         "on" if wg_peer_sync else "off",
         "on" if wg_radius_sync else "off",
+        "on" if coa_executor else "off",
     )
 
     # Initial routing table load
@@ -620,6 +679,16 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
             await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECONDS)
             routing.heartbeat(config.PROXY_ID, time.time() - start_time)
             routing.ensure_fresh()
+            # Drain panel-queued CoA/Disconnect commands picked up by
+            # the just-completed routing-table refresh. Runs in a worker
+            # thread because the inner UDP send + HTTPS POST are
+            # blocking and would stall RADIUS packet I/O on the loop.
+            # tick_safe() never raises into the executor scheduler.
+            if coa_executor is not None:
+                try:
+                    await loop.run_in_executor(None, coa_executor.tick_safe)
+                except Exception as exc:                          # pragma: no cover
+                    log.debug("coa executor tick error (ignored): %s", exc)
 
     # Telemetry flush loop — runs the blocking POST (with retry/backoff) off the
     # event loop in a worker thread so backoff sleeps never stall packet I/O.

@@ -368,3 +368,29 @@ class Config:
     CHR_SECRET_GRACE_SECONDS = _env_int_bounded(
         "PROXY_CHR_SECRET_GRACE_SECONDS", 86400, 60, 7 * 86400,
     )
+
+    # ── Panel-queued CoA / Disconnect commands (proxy outbound poller) ────
+    # The proxy stays outbound-only (no inbound HTTP listener — see
+    # tests/test_proxy_not_in_license_path.py). The panel publishes
+    # pending Disconnect commands in the existing /api/proxy/routing-table
+    # response under `pending_coa`; the executor consumes them on each
+    # maintenance tick, dispatches RFC 5176 Disconnect over UDP 3799 to
+    # the CHR(s) on wg-data, and POSTs the result back via
+    # /api/proxy/coa-result.
+    COA_EXECUTOR_ENABLED = _env_bool("PROXY_COA_EXECUTOR_ENABLED", True)
+    COA_RESULT_ENDPOINT = _env("PROXY_COA_RESULT_ENDPOINT", "") or (
+        ADMIN_BASE_URL.rstrip("/") + "/api/proxy/coa-result"
+    )
+    COA_EXECUTED_STATE_PATH = _env(
+        "PROXY_COA_EXECUTED_STATE_PATH",
+        "/var/lib/hobe-radius-proxy/coa-executed.json",
+    )
+    # Bounded retention so a chatty panel can't grow this unboundedly.
+    # The panel-side dequeue keeps `pending_coa` short anyway; this is
+    # the safety net.
+    COA_EXECUTED_MAX_IDS = _env_int_bounded(
+        "PROXY_COA_EXECUTED_MAX_IDS", 8192, 256, 65536,
+    )
+    COA_RESULT_TIMEOUT = _env_int_bounded(
+        "PROXY_COA_RESULT_TIMEOUT", 10, 1, 60,
+    )
