@@ -109,6 +109,12 @@ class RoutingTable:
         # gap — not frozen yet). Usernames lowercased. Absent ⇒ empty ⇒ nobody
         # is movable (safe default: rebalance moves are opt-in).
         self._movable_users: set[str] = set()
+        # Panel-queued CoA / Disconnect commands. Frozen contract field:
+        # data["pending_coa"] — see CoaExecutor (coa_executor.py) which
+        # consumes this list, dedups by id, dispatches over RFC 5176, and
+        # POSTs the outcome to /api/proxy/coa-result. Empty when the
+        # panel has nothing queued.
+        self._pending_coa: list[dict] = []
         self._last_refresh: float = 0
         self._fail_open_chr = fail_open_chr
         self._stats = {
@@ -266,8 +272,30 @@ class RoutingTable:
             panel_secret = str(data.get("chr_shared_secret") or "")
             if panel_secret:
                 self._adopt_chr_secret(panel_secret)
+            # Panel-queued CoA / Disconnect commands — frozen contract
+            # field `pending_coa`. Consumed by CoaExecutor on the next
+            # maintenance tick. We accept only entries that are dicts
+            # with a non-empty `id` (everything else is malformed —
+            # silently dropped here so a future panel-side serialisation
+            # bug can't kill the refresh path).
+            raw_pending = data.get("pending_coa")
+            if isinstance(raw_pending, list):
+                cleaned: list[dict] = []
+                for entry in raw_pending:
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = str(entry.get("id") or "").strip()
+                    if not cid:
+                        continue
+                    cleaned.append(entry)
+                self._pending_coa = cleaned
+            else:
+                self._pending_coa = []
             self._last_refresh = time.time()
-            log.info("Routing table refreshed: %d realms, %d CHR nodes", len(routes), len(chr_ips))
+            log.info(
+                "Routing table refreshed: %d realms, %d CHR nodes, %d pending CoA",
+                len(routes), len(chr_ips), len(self._pending_coa),
+            )
             return True
 
         except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
@@ -337,6 +365,19 @@ class RoutingTable:
     def has_node_status(self) -> bool:
         """Whether the panel supplied any node status (gates forced-move logic)."""
         return bool(self._node_status)
+
+    def pending_coa(self) -> list[dict]:
+        """Snapshot of panel-queued CoA / Disconnect commands.
+
+        Each entry has the FROZEN shape:
+            { "id": "<uuid>", "realm": "<realm>", "action": "disconnect",
+              "target_node_id": <int|null>, "reason": "<free-form>" }
+
+        Returned as a shallow copy so the caller can iterate without
+        racing the next refresh. The CoaExecutor (coa_executor.py) is
+        the sole consumer.
+        """
+        return list(self._pending_coa)
 
     def is_user_movable(self, username: str) -> bool:
         """Per-user movable opt-in (Phase 7). Unknown users ⇒ NOT movable.
