@@ -154,8 +154,15 @@ class WgPeerSync:
         enabled: bool = True,
         runner: Optional[_Runner] = None,
         http_get: Optional[Callable] = None,
+        # Parametrized for the second instance (wg-radius) — defaults
+        # preserve the original wg-data contract byte-for-byte.
+        endpoint_path: str = "/api/proxy/wg-peers",
+        peers_json_key: str = "peers",
+        log_prefix: str = "wg peer sync",
     ) -> None:
-        self._url = admin_base_url.rstrip("/") + "/api/proxy/wg-peers"
+        self._url = admin_base_url.rstrip("/") + endpoint_path
+        self._peers_key = peers_json_key
+        self._log_prefix = log_prefix
         self._secret = shared_secret
         self._iface = interface
         self._state_path = state_path
@@ -199,9 +206,9 @@ class WgPeerSync:
             return set(), [], f"bad json: {exc}"
         if not isinstance(body, dict):
             return set(), [], "bad json: not an object"
-        raw_peers = body.get("peers")
+        raw_peers = body.get(self._peers_key)
         if not isinstance(raw_peers, list):
-            return set(), [], "bad json: peers not a list"
+            return set(), [], f"bad json: '{self._peers_key}' not a list"
 
         peers: set[DesiredPeer] = set()
         skipped: list[str] = []
@@ -287,9 +294,9 @@ class WgPeerSync:
             return True
         except OSError as exc:
             log.warning(
-                "wg peer sync: state save to %s failed: %s "
+                "%s: state save to %s failed: %s "
                 "(reconcile still effective; next pass re-detects).",
-                self._state_path, exc,
+                self._log_prefix, self._state_path, exc,
             )
             return False
 
@@ -306,19 +313,19 @@ class WgPeerSync:
         """
         rc, _out, err = self._runner(argv)
         if rc == 0:
-            log.info("wg peer sync: %s", op_log)
+            log.info("%s: %s", self._log_prefix, op_log)
             return True
         fix_hint = (err or "").strip() or f"rc={rc}"
         if not self._priv_warning_logged:
             log.warning(
-                "wg peer sync: `%s` failed (%s). Install the scoped sudoers "
+                "%s: `%s` failed (%s). Install the scoped sudoers "
                 "rule (systemd/setup-wg-sudoers.sh) or run the proxy with "
                 "CAP_NET_ADMIN to enable apply. Until then, falling back to "
                 "dry-run — peer changes will be LOGGED but NOT applied.",
-                " ".join(argv), fix_hint,
+                self._log_prefix, " ".join(argv), fix_hint,
             )
             self._priv_warning_logged = True
-        log.info("wg peer sync: DRY-RUN would %s", op_log)
+        log.info("%s: DRY-RUN would %s", self._log_prefix, op_log)
         return False
 
     def reconcile(self) -> ReconcileResult:
@@ -337,12 +344,12 @@ class WgPeerSync:
             if fetch_err.startswith("endpoint not exposed"):
                 if not self._endpoint_404_logged:
                     log.info(
-                        "wg peer sync: %s — feature inert this cycle.",
-                        fetch_err,
+                        "%s: %s — feature inert this cycle.",
+                        self._log_prefix, fetch_err,
                     )
                     self._endpoint_404_logged = True
             else:
-                log.warning("wg peer sync: fetch failed — %s", fetch_err)
+                log.warning("%s: fetch failed — %s", self._log_prefix, fetch_err)
             return result
         result.desired_count = len(desired)
 
@@ -354,8 +361,8 @@ class WgPeerSync:
             result.mode = "dry-run"
             result.error = f"wg show {self._iface} failed: {show_err}"
             log.warning(
-                "wg peer sync: %s — cannot reconcile (advisory only).",
-                result.error,
+                "%s: %s — cannot reconcile (advisory only).",
+                self._log_prefix, result.error,
             )
             return result
         result.actual_count = len(actual)
@@ -425,8 +432,8 @@ class WgPeerSync:
 
         if not to_add and not to_remove:
             log.debug(
-                "wg peer sync: in sync (%d peers, %d actual)",
-                len(desired), len(actual),
+                "%s: in sync (%d peers, %d actual)",
+                self._log_prefix, len(desired), len(actual),
             )
         return result
 
@@ -437,5 +444,5 @@ class WgPeerSync:
         try:
             return self.reconcile()
         except Exception as exc:                          # pragma: no cover
-            log.warning("wg peer sync: reconcile crashed (swallowed): %s", exc)
+            log.warning("%s: reconcile crashed (swallowed): %s", self._log_prefix, exc)
             return None

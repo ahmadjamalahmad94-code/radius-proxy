@@ -82,6 +82,36 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: tuple) -> None:
         self._loop.create_task(self._handle(data, addr))
 
+    def _validate_request_secret(self, raw: bytes) -> Optional[str]:
+        """Validate inbound Message-Authenticator against current → previous
+        (during the rotation grace window) → bootstrap env. Returns the
+        secret that validated, or ``None`` if none did.
+
+        Sourcing precedence (§6.1, owner's rule #1):
+          1. ``routing.chr_secret()`` — the panel-canonical value from the
+             authenticated routing-table, persisted across restarts.
+          2. ``routing.previous_chr_secret_in_grace()`` — the pre-rotation
+             secret while still inside the 24h dual-accept window, so
+             CHRs that haven't re-imported scripts yet keep authenticating.
+          3. ``self._chr_secret`` — the bootstrap ``PROXY_CHR_SECRET`` env
+             value, used ONLY when the panel hasn't supplied one yet
+             (before the first successful routing-table fetch).
+
+        For packets WITHOUT a Message-Authenticator attribute,
+        ``verify_message_authenticator`` returns True regardless of the
+        secret — so for legacy non-MA Access-Requests current/bootstrap
+        is returned (existing behavior preserved).
+
+        Never logs any secret value.
+        """
+        current = self._routing.chr_secret() or self._chr_secret
+        if rp.verify_message_authenticator(raw, current):
+            return current
+        previous = self._routing.previous_chr_secret_in_grace()
+        if previous and rp.verify_message_authenticator(raw, previous):
+            return previous
+        return None
+
     async def _handle(self, data: bytes, addr: tuple) -> None:
         src_ip = addr[0]
 
@@ -105,8 +135,18 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
             pkt.username if Config.LOG_REALM_LOOKUPS else "<hidden>",
         )
 
-        # 3. Verify Message-Authenticator (if present)
-        if not rp.verify_message_authenticator(pkt.raw, self._chr_secret):
+        # 3. Per-packet CHR shared secret + Message-Authenticator dual-accept.
+        # §6.1 (THE HEADLINE): the secret is read PER PACKET from the
+        # routing-table the panel publishes — never from a frozen env-bound
+        # constructor value. During a rotation, dual-accept validates the
+        # MA against current AND previous (within the 24h grace window) so
+        # NO Access-Request is dropped while CHRs re-import scripts. The
+        # response is then signed with whichever secret validated, so the
+        # CHR can verify the Response-Authenticator against the one it
+        # used to sign. This is the change that ends the owner's
+        # manual-secret-matching pain forever.
+        chr_secret = self._validate_request_secret(pkt.raw)
+        if chr_secret is None:
             log.warning("Message-Authenticator mismatch from %s — dropped", src_ip)
             self._routing.record_request(accepted=False, error=True)
             return
@@ -139,14 +179,14 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         if not realm:
             log.warning("No @realm in username '%s' from %s", pkt.username, src_ip)
             self._routing.record_request(accepted=False, error=False)
-            await self._send_reject(pkt, addr)
+            await self._send_reject(pkt, addr, chr_secret)
             return
 
         route = self._routing.lookup(realm)
         if not route:
             log.warning("Unknown realm '%s' from %s", realm, src_ip)
             self._routing.record_request(accepted=False, error=False)
-            await self._send_reject(pkt, addr)
+            await self._send_reject(pkt, addr, chr_secret)
             return
 
         # 4b. CHR Fleet placement (Phase 4): NON-enforcing observability,
@@ -174,7 +214,7 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         if not route.chr_is_allowed(src_ip):
             log.warning("CHR %s not allowed for realm '%s'", src_ip, realm)
             self._routing.record_request(accepted=False, error=False)
-            await self._send_reject(pkt, addr)
+            await self._send_reject(pkt, addr, chr_secret)
             return
 
         if not route.secret:
@@ -182,9 +222,10 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
             self._routing.record_request(accepted=False, error=True)
             return
 
-        # 5. Re-sign packet for target RADIUS
+        # 5. Re-sign packet for target RADIUS — use the secret that
+        # validated this packet on the way in (current OR previous-in-grace).
         try:
-            forwarded = rp.replace_secret_in_packet(pkt, self._chr_secret, route.secret)
+            forwarded = rp.replace_secret_in_packet(pkt, chr_secret, route.secret)
         except Exception as exc:
             log.error("Failed to re-sign packet for realm '%s': %s", realm, exc)
             self._routing.record_request(accepted=False, error=True)
@@ -201,9 +242,48 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         except rp.RadiusError:
             fwd_auth = pkt.authenticator  # should never happen
 
-        # 6. Forward to target RADIUS
+        # 6. Forward to target RADIUS.
         target_addr = route.acct_addr if self._is_accounting else route.auth_addr
         response_data = await self._forward(forwarded, target_addr)
+
+        # 6b. §6.2 — route-secret rotation grace.
+        # The customer's FreeRADIUS converges on a new route secret via
+        # bridge heartbeat (≤300 s by design) while the proxy converges via
+        # routing-table refresh (≤60 s). In the gap, the upstream still has
+        # the OLD secret and silently drops requests we signed with the
+        # NEW secret. Detect that by way of a TIMEOUT, then RETRY ONCE
+        # with the previous secret if the realm is still in grace. The
+        # response (if any) is verified + re-signed back to CHR with the
+        # secret that actually round-tripped — no drops at either end.
+        # The retry is bounded: at most one extra forward per packet, and
+        # only while a rotation is active for that specific realm.
+        upstream_secret = route.secret
+        if response_data is None and not self._is_accounting:
+            prev_route_secret = self._routing.route_previous_secret_in_grace(realm)
+            if prev_route_secret and prev_route_secret != route.secret:
+                try:
+                    forwarded_prev = rp.replace_secret_in_packet(
+                        pkt, chr_secret, prev_route_secret,
+                    )
+                    fwd_auth_prev = rp.parse(forwarded_prev).authenticator
+                except (rp.RadiusError, Exception) as exc:
+                    log.warning(
+                        "Route-secret retry: re-sign with previous failed "
+                        "for realm '%s': %s",
+                        realm, exc,
+                    )
+                else:
+                    log.info(
+                        "Route-secret retry: upstream timed out for realm "
+                        "'%s' — retrying with previous secret (rotation "
+                        "grace).",
+                        realm,
+                    )
+                    retry_data = await self._forward(forwarded_prev, target_addr)
+                    if retry_data is not None:
+                        response_data = retry_data
+                        upstream_secret = prev_route_secret
+                        fwd_auth = fwd_auth_prev
 
         if response_data is None:
             log.warning(
@@ -215,18 +295,25 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
                 # WARNING: the accounting record is NOT saved upstream for this request.
                 # ack_on_timeout only acknowledges the CHR node; it does NOT prove
                 # target accounting persistence.
-                await self._send_accounting_ack(pkt, addr)
+                await self._send_accounting_ack(pkt, addr, chr_secret)
             self._routing.record_request(accepted=False, error=True)
             return
 
-        # 7. Parse and re-sign response for CHR
+        # 7. Parse and re-sign response for CHR.
+        # We verify the upstream response with the SAME secret that
+        # round-tripped (current OR previous, depending on §6.2 retry
+        # above). We re-sign for the CHR with the secret that validated
+        # the original request (current OR previous, depending on §6.1).
+        # Both halves of the dual-accept window collapse to "use whichever
+        # secret actually worked on the wire" — never drop a packet over
+        # an in-flight rotation.
         try:
             resp_pkt = rp.parse(response_data)
             rebuilt = rp.rebuild_response(
                 resp_pkt,
                 request_auth=pkt.authenticator,             # original CHR authenticator
-                old_secret=route.secret,
-                new_secret=self._chr_secret,
+                old_secret=upstream_secret,
+                new_secret=chr_secret,
                 verify_auth=fwd_auth,                       # forwarded authenticator (differs for accounting)
                 strict_verify=self._strict_response_verify, # drop on mismatch in production
             )
@@ -282,27 +369,37 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
             if transport:
                 transport.close()
 
-    async def _send_reject(self, pkt: rp.RadiusPacket, addr: tuple) -> None:
-        """Send Access-Reject to CHR for requests we can't route."""
+    async def _send_reject(
+        self, pkt: rp.RadiusPacket, addr: tuple, chr_secret: str,
+    ) -> None:
+        """Send Access-Reject to CHR for requests we can't route.
+
+        ``chr_secret`` is the secret that validated the original request
+        (§6.1 dual-accept) — signing with anything else would cause the
+        CHR to drop the Reject on Response-Authenticator mismatch.
+        """
         if self._is_accounting:
             return  # Don't reject accounting packets — RFC says drop silently
         attrs_bytes = b""
         length = rp.HEADER_SIZE + len(attrs_bytes)
         auth = rp.response_authenticator(
             rp.CODE_ACCESS_REJECT, pkt.identifier, length,
-            pkt.authenticator, attrs_bytes, self._chr_secret,
+            pkt.authenticator, attrs_bytes, chr_secret,
         )
         reject = struct.pack("!BBH", rp.CODE_ACCESS_REJECT, pkt.identifier, length) + auth
         if self._transport:
             self._transport.sendto(reject, addr)
 
     async def _send_accounting_ack(
-        self, pkt: rp.RadiusPacket, addr: tuple
+        self, pkt: rp.RadiusPacket, addr: tuple, chr_secret: str,
     ) -> None:
         """Send a fake Accounting-Response (code 5) to CHR.
 
         Used only when PROXY_ACCT_TIMEOUT_MODE=fake_ack and the upstream
         target RADIUS timed out. Stops CHR from retransmitting endlessly.
+
+        ``chr_secret`` is the secret that validated the incoming request
+        (§6.1 dual-accept) so the CHR can verify Response-Authenticator.
 
         WARNING: The accounting record is NOT saved upstream for this packet.
         Each fake ACK is logged at WARNING level for auditability.
@@ -311,7 +408,7 @@ class RadiusProxyProtocol(asyncio.DatagramProtocol):
         length = rp.HEADER_SIZE + len(attrs_bytes)
         auth = rp.response_authenticator(
             rp.CODE_ACCOUNTING_RESPONSE, pkt.identifier, length,
-            pkt.authenticator, attrs_bytes, self._chr_secret,
+            pkt.authenticator, attrs_bytes, chr_secret,
         )
         ack = (
             struct.pack("!BBH", rp.CODE_ACCOUNTING_RESPONSE, pkt.identifier, length)
@@ -429,6 +526,39 @@ def _build_wg_peer_sync(config: type) -> "Optional[WgPeerSync]":
     )
 
 
+def _build_wg_radius_sync(config: type) -> "Optional[WgPeerSync]":
+    """SECOND reconciler instance — applies customer-RADIUS peers to the
+    NEW ``wg-radius`` interface (10.200.0.1/16, listen 51822) by consuming
+    the panel's ``GET /api/proxy/radius-peers``. Same class, different
+    endpoint + JSON key + interface + state file. Returns None when
+    disabled. The asyncio loop runs both reconcilers as side-tasks; they
+    are completely independent — wg-data outages never affect wg-radius
+    and vice-versa.
+    """
+    if not getattr(config, "FLEET_WG_RADIUS_SYNC_ENABLED", False):
+        return None
+    return WgPeerSync(
+        admin_base_url=config.ADMIN_BASE_URL,
+        shared_secret=config.PROXY_SHARED_SECRET,
+        interface=config.FLEET_WG_RADIUS_INTERFACE,
+        state_path=config.FLEET_WG_RADIUS_STATE_PATH,
+        wg_path=config.FLEET_WG_BIN,
+        apply_mode=config.FLEET_WG_APPLY_MODE,
+        timeout=config.FLEET_WG_RADIUS_SYNC_TIMEOUT,
+        enabled=True,
+        endpoint_path=config.FLEET_WG_RADIUS_SYNC_ENDPOINT_PATH,
+        # FROZEN contract (cross-repo audit 2026-06-12): the panel's
+        # /api/proxy/radius-peers response uses the top-level key `peers`
+        # — deliberately matching the §1421c16 wg-peers shape. Per-peer
+        # field names (`public_key`, `allowed_ips`, `name`, `endpoint`)
+        # already match the WgPeerSync parser unchanged. The wg-data and
+        # wg-radius reconcilers therefore BOTH read the default `peers`
+        # — what disambiguates them is the endpoint_path + interface.
+        peers_json_key="peers",
+        log_prefix="wg radius sync",
+    )
+
+
 async def run_proxy(config: type, routing: RoutingTable) -> None:
     """Main proxy coroutine — runs Auth + Acct servers + heartbeat loop."""
     loop = asyncio.get_event_loop()
@@ -436,6 +566,7 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
 
     telemetry, placement, enforcement = _build_fleet_components(config, routing)
     wg_peer_sync = _build_wg_peer_sync(config)
+    wg_radius_sync = _build_wg_radius_sync(config)
     decision_probe = bool(getattr(config, "FLEET_PLACEMENT_DECISION_PROBE", False))
 
     # Auth server (1812)
@@ -472,11 +603,12 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
 
     log.info(
         "RADIUS Proxy started | auth=:%d acct=:%d | telemetry=%s placement=%s "
-        "enforcement=%s wg_peer_sync=%s",
+        "enforcement=%s wg_peer_sync=%s wg_radius_sync=%s",
         config.RADIUS_AUTH_PORT, config.RADIUS_ACCT_PORT,
         "on" if telemetry else "off", "on" if placement else "off",
         "on" if enforcement else "off",
         "on" if wg_peer_sync else "off",
+        "on" if wg_radius_sync else "off",
     )
 
     # Initial routing table load
@@ -543,6 +675,24 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
                 log.debug("wg peer sync loop error (ignored): %s", exc)
             await asyncio.sleep(interval)
 
+    # Customer RADIUS ↔ Proxy tunnel reconciler — same shape as the wg-data
+    # loop above but driven by /api/proxy/radius-peers and acting on
+    # wg-radius. Independent of the wg-data loop: a wg-data outage cannot
+    # block customer onboarding and vice-versa.
+    async def _wg_radius_sync_loop():
+        if wg_radius_sync is None:
+            return
+        interval = max(
+            10, int(getattr(config, "FLEET_WG_RADIUS_SYNC_INTERVAL", 60)),
+        )
+        await asyncio.sleep(min(5, interval))
+        while True:
+            try:
+                await loop.run_in_executor(None, wg_radius_sync.reconcile_safe)
+            except Exception as exc:  # pragma: no cover - reconcile_safe guards
+                log.debug("wg radius sync loop error (ignored): %s", exc)
+            await asyncio.sleep(interval)
+
     tasks = [asyncio.ensure_future(_maintenance_loop())]
     if telemetry is not None:
         tasks.append(asyncio.ensure_future(_telemetry_loop()))
@@ -550,6 +700,8 @@ async def run_proxy(config: type, routing: RoutingTable) -> None:
         tasks.append(asyncio.ensure_future(_enforcement_loop()))
     if wg_peer_sync is not None:
         tasks.append(asyncio.ensure_future(_wg_peer_sync_loop()))
+    if wg_radius_sync is not None:
+        tasks.append(asyncio.ensure_future(_wg_radius_sync_loop()))
     try:
         await asyncio.gather(*tasks)
     finally:

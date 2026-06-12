@@ -325,3 +325,46 @@ class Config:
         _apply_mode_raw if _apply_mode_raw in ("auto", "apply", "dry_run")
         else "auto"
     )
+
+    # ── Customer RADIUS ↔ Proxy tunnel (§4.2 of design) ───────────────────
+    # SECOND reconciler instance, targeting the NEW wg-radius interface
+    # (10.200.0.1/16, listen 51822). Consumes the panel's
+    # GET /api/proxy/radius-peers and applies customer pubkeys to wg-radius
+    # so a freshly-licensed radius-module appears at 10.200.<id>.2 with
+    # zero operator action. Same safety model as the wg-data reconciler:
+    # safe-by-default dry-run when unprivileged, never touches operator-
+    # added peers, never raises into the asyncio loop.
+    FLEET_WG_RADIUS_SYNC_ENABLED = _env_bool("PROXY_WG_RADIUS_SYNC_ENABLED", True)
+    FLEET_WG_RADIUS_SYNC_ENDPOINT_PATH = _env(
+        "PROXY_WG_RADIUS_SYNC_ENDPOINT_PATH", "/api/proxy/radius-peers",
+    )
+    FLEET_WG_RADIUS_SYNC_INTERVAL = _env_int_bounded(
+        "PROXY_WG_RADIUS_SYNC_INTERVAL", 60, 10, 3600,
+    )
+    FLEET_WG_RADIUS_SYNC_TIMEOUT = _env_int_bounded(
+        "PROXY_WG_RADIUS_SYNC_TIMEOUT", 10, 1, 60,
+    )
+    FLEET_WG_RADIUS_INTERFACE = _env("PROXY_WG_RADIUS_INTERFACE", "wg-radius")
+    FLEET_WG_RADIUS_STATE_PATH = _env(
+        "PROXY_WG_RADIUS_STATE_PATH",
+        "/var/lib/hobe-radius-proxy/managed-radius-peers.json",
+    )
+
+    # ── §6.1 CHR-shared-secret sync — bootstrap + rotation grace ──────────
+    # The owner's manual-secret-matching pain is permanently fixed by
+    # construction: the proxy reads chr_shared_secret PER PACKET from the
+    # authenticated routing-table the panel publishes. The env value above
+    # (PROXY_CHR_SECRET → CHR_SHARED_SECRET) is now BOOTSTRAP-ONLY — used
+    # solely before the first successful routing-table fetch — and demoted
+    # automatically with a one-shot WARNING when the panel sends a different
+    # value. The state file persists the last-known panel secret (0600) so
+    # the proxy keeps relaying across restarts during a panel outage.
+    # Default grace = 24h (86400s) is wide enough for the owner to
+    # re-import CHR scripts at leisure with zero RADIUS drops.
+    CHR_SECRET_STATE_PATH = _env(
+        "PROXY_CHR_SECRET_STATE_PATH",
+        "/var/lib/hobe-radius-proxy/chr-secret.json",
+    )
+    CHR_SECRET_GRACE_SECONDS = _env_int_bounded(
+        "PROXY_CHR_SECRET_GRACE_SECONDS", 86400, 60, 7 * 86400,
+    )

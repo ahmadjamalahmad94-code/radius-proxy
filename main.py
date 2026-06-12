@@ -72,6 +72,13 @@ def main() -> None:
         shared_secret=Config.PROXY_SHARED_SECRET,
         refresh_interval=Config.ROUTING_REFRESH_SECONDS,
         fail_open_chr=Config.FAIL_OPEN_CHR_ALLOWLIST,
+        # §6.1 — env value becomes BOOTSTRAP-ONLY; the panel's
+        # chr_shared_secret in /api/proxy/routing-table is the source of
+        # truth on every refresh.
+        bootstrap_chr_secret=Config.CHR_SHARED_SECRET,
+        chr_secret_state_path=Config.CHR_SECRET_STATE_PATH,
+        chr_secret_grace_seconds=Config.CHR_SECRET_GRACE_SECONDS,
+        static_node_map=Config.FLEET_CHR_NODE_MAP,
     )
 
     if Config.FAIL_OPEN_CHR_ALLOWLIST:

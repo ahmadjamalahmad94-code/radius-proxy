@@ -21,6 +21,13 @@ WG_LISTEN_PORT="${PROXY_WG_DATA_LISTEN:-51821}"
 AUTH_PORT="${PROXY_AUTH_PORT:-1812}"
 ACCT_PORT="${PROXY_ACCT_PORT:-1813}"
 
+# Customer RADIUS tunnel (design §4.2): wg-radius is the SECOND wireguard
+# interface on the proxy host — customer RADIUS servers dial in to
+# 51822/udp and live in 10.200.0.0/16. RADIUS is OUTBOUND from the proxy
+# to each customer (proxy.py forwards to 10.200.<id>.2:1812/1813 inside
+# the tunnel) — we do NOT add inbound RADIUS rules for this iface.
+WG_RADIUS_LISTEN_PORT="${PROXY_WG_RADIUS_LISTEN:-51822}"
+
 if ! command -v ufw >/dev/null 2>&1; then
     echo "setup-ufw: 'ufw' not installed — run: apt -y install ufw" >&2
     exit 1
@@ -31,7 +38,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-echo "setup-ufw: applying rules — wg-iface=${WG_IF} subnet=${WG_SUBNET} wg-port=${WG_LISTEN_PORT}/udp"
+echo "setup-ufw: applying rules — wg-iface=${WG_IF} subnet=${WG_SUBNET} wg-port=${WG_LISTEN_PORT}/udp wg-radius-port=${WG_RADIUS_LISTEN_PORT}/udp"
 
 # ── 1. SSH first (lockout prevention) + default-deny baseline. ────────
 ufw --force default deny incoming
@@ -40,6 +47,13 @@ ufw allow OpenSSH
 
 # ── 2. wg-data tunnel — publicly reachable so CHRs can hand-shake. ────
 ufw allow "${WG_LISTEN_PORT}/udp" comment 'wg-data from CHRs'
+
+# ── 2bis. wg-radius tunnel — publicly reachable so customer RADIUS dials in.
+# RADIUS itself is NOT inbound here — the proxy DIALS OUT to each customer
+# inside the tunnel (10.200.<id>.2:1812/1813). Crypto-key routing enforces
+# that each customer only sees its own /32, so opening 51822 publicly is
+# safe — without a registered pubkey the handshake fails.
+ufw allow "${WG_RADIUS_LISTEN_PORT}/udp" comment 'wg-radius from customer RADIUS'
 
 # ── 3. RADIUS — ONLY on wg-data, ONLY from CHR wg-data subnet. ────────
 # These rules survive even if PROXY_LISTEN_HOST is mis-set to 0.0.0.0:
