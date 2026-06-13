@@ -29,13 +29,22 @@ The same scoped sudoers rule installed by
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
+
+
+# Systemd unit names the setup script / runtime should look at when
+# auto-detecting which user the proxy runs as. Order = priority.
+DEFAULT_PROXY_UNIT_CANDIDATES = (
+    "radius-proxy.service",
+    "hobe-radius-proxy.service",
+)
 
 
 # WireGuard public keys are 32 raw bytes base64-encoded → 44 chars
@@ -167,3 +176,94 @@ class CachingPubkeyProvider:
                 self._value = pub
                 self._fetched_at = now
         return pub
+
+
+# ── Service-user / wg-binary detection (mirrors setup-wg-sudoers.sh) ──
+#
+# The setup script auto-detects which account the proxy actually runs
+# as so the operator never has to manually create a `hobeproxy` user.
+# These Python helpers exist mostly so the detection logic is
+# unit-testable; production callers still drive everything from env
+# vars (PROXY_WG_BIN / PROXY_WG_QUICK_BIN) which override these
+# defaults.
+
+
+def detect_proxy_service_user(
+    *,
+    systemctl_runner: Optional[Callable[[list[str]], "tuple[int, str, str]"]] = None,
+    env_value: Optional[str] = None,
+    unit_candidates: "tuple[str, ...]" = DEFAULT_PROXY_UNIT_CANDIDATES,
+    default: str = "root",
+) -> str:
+    """Mirror of the bash detect_user() in setup-wg-sudoers.sh.
+
+    Resolution order (first non-empty wins):
+      1. ``systemctl show <unit> -p User --value`` for each unit in
+         ``unit_candidates``. Empty result = systemd unit either does
+         not exist OR declares no User= directive (which means systemd
+         runs the service as root by convention).
+      2. ``env_value`` (the operator's PROXY_SERVICE_USER env override).
+      3. ``default`` ("root").
+
+    Returning "root" is the signal to the bash script that we are in
+    "ROOT mode" — skip the sudoers install entirely (root can call
+    wg/wg-quick directly).
+
+    ``systemctl_runner`` is a (rc, stdout, stderr) callable injected by
+    tests so we can drive the detection without an actual systemd.
+    """
+    run = systemctl_runner or _run
+    for unit in unit_candidates:
+        rc, out, _err = run(["systemctl", "show", unit, "-p", "User", "--value"])
+        if rc == 0:
+            value = (out or "").strip().splitlines()[0].strip() if out else ""
+            if value:
+                return value
+    if env_value:
+        return env_value.strip()
+    return default
+
+
+def is_root_mode(service_user: str) -> bool:
+    """True iff the service user is root (or empty — systemd default)."""
+    u = (service_user or "").strip()
+    return u == "" or u == "root"
+
+
+def recommended_wg_bins(
+    *,
+    euid: Optional[int] = None,
+    helper_present: Optional[bool] = None,
+    helper_path: str = "/usr/local/sbin/hobe-wg",
+    helper_quick_path: str = "/usr/local/sbin/hobe-wg-quick",
+) -> "tuple[str, str]":
+    """Pick sensible defaults for (PROXY_WG_BIN, PROXY_WG_QUICK_BIN)
+    based on the current effective UID and whether the scoped wrappers
+    are present on disk.
+
+    The proxy itself does NOT call this in the hot path — the env vars
+    win — but ``DEPLOY_PROXY.md`` references it as the recommended
+    default so a deploy that doesn't customise env still does the
+    right thing.
+
+    Decision matrix:
+        euid == 0          → /usr/bin/wg + /usr/bin/wg-quick (direct)
+        euid != 0, helpers → /usr/local/sbin/hobe-wg{,-quick}
+        euid != 0, no help → /usr/bin/wg + /usr/bin/wg-quick (will fail
+                              at runtime — operator must install the
+                              sudoers; we don't pretend otherwise).
+    """
+    if euid is None:
+        try:
+            euid = os.geteuid()                             # POSIX only
+        except AttributeError:                              # pragma: no cover
+            euid = 0                                        # Windows — assume "root"-like
+    if euid == 0:
+        return ("/usr/bin/wg", "/usr/bin/wg-quick")
+    if helper_present is None:
+        helper_present = (
+            os.path.exists(helper_path) and os.path.exists(helper_quick_path)
+        )
+    if helper_present:
+        return (helper_path, helper_quick_path)
+    return ("/usr/bin/wg", "/usr/bin/wg-quick")
