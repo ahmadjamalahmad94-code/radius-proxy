@@ -32,6 +32,7 @@ from coa import CoaSender
 from coa_executor import CoaExecutor
 from enforcement import EnforcementEngine, EnforcementReporter, SessionTracker
 from wg_peer_sync import WgPeerSync
+from wg_provisioning import persist_iface
 
 log = logging.getLogger(__name__)
 
@@ -515,15 +516,29 @@ def _build_wg_peer_sync(config: type) -> "Optional[WgPeerSync]":
     Phase-4/7 wiring test contract stays a 3-tuple."""
     if not getattr(config, "FLEET_WG_PEER_SYNC_ENABLED", False):
         return None
+    # Persist hook — writes the runtime peer set back to
+    # /etc/wireguard/wg-data.conf via `wg-quick save wg-data` so peer
+    # adds survive a reboot. Fix for the chr-vpn-2 onboarding incident
+    # (operator added the CHR via `wg set` by hand AND THEN had to
+    # also persist to /etc/wireguard/wg-data.conf to make it stick).
+    iface = config.FLEET_WG_INTERFACE
+    wg_quick = getattr(config, "PROXY_WG_QUICK_BIN", "wg-quick")
+    persist_fn = (
+        (lambda iface=iface, wg_quick=wg_quick:
+         persist_iface(iface, wg_quick))
+        if getattr(config, "PROXY_WG_PERSIST_ON_RECONCILE", True)
+        else None
+    )
     return WgPeerSync(
         admin_base_url=config.ADMIN_BASE_URL,
         shared_secret=config.PROXY_SHARED_SECRET,
-        interface=config.FLEET_WG_INTERFACE,
+        interface=iface,
         state_path=config.FLEET_WG_STATE_PATH,
         wg_path=config.FLEET_WG_BIN,
         apply_mode=config.FLEET_WG_APPLY_MODE,
         timeout=config.FLEET_WG_PEER_SYNC_TIMEOUT,
         enabled=True,
+        persist_fn=persist_fn,
     )
 
 
@@ -538,10 +553,18 @@ def _build_wg_radius_sync(config: type) -> "Optional[WgPeerSync]":
     """
     if not getattr(config, "FLEET_WG_RADIUS_SYNC_ENABLED", False):
         return None
+    iface = config.FLEET_WG_RADIUS_INTERFACE
+    wg_quick = getattr(config, "PROXY_WG_QUICK_BIN", "wg-quick")
+    persist_fn = (
+        (lambda iface=iface, wg_quick=wg_quick:
+         persist_iface(iface, wg_quick))
+        if getattr(config, "PROXY_WG_PERSIST_ON_RECONCILE", True)
+        else None
+    )
     return WgPeerSync(
         admin_base_url=config.ADMIN_BASE_URL,
         shared_secret=config.PROXY_SHARED_SECRET,
-        interface=config.FLEET_WG_RADIUS_INTERFACE,
+        interface=iface,
         state_path=config.FLEET_WG_RADIUS_STATE_PATH,
         wg_path=config.FLEET_WG_BIN,
         apply_mode=config.FLEET_WG_APPLY_MODE,
@@ -557,6 +580,7 @@ def _build_wg_radius_sync(config: type) -> "Optional[WgPeerSync]":
         # — what disambiguates them is the endpoint_path + interface.
         peers_json_key="peers",
         log_prefix="wg radius sync",
+        persist_fn=persist_fn,
     )
 
 

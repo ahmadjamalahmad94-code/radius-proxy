@@ -394,3 +394,22 @@ class Config:
     COA_RESULT_TIMEOUT = _env_int_bounded(
         "PROXY_COA_RESULT_TIMEOUT", 10, 1, 60,
     )
+
+    # ── Live proxy wg-data pubkey publish (chr-vpn-2 incident fix) ────────
+    # The proxy reads its CURRENT `wg show wg-data public-key` value and
+    # publishes it in every heartbeat so the panel renders every CHR
+    # script with the right key. Cached for this many seconds to avoid
+    # fork-exec'ing on every 30s heartbeat (the key changes ~never).
+    PROXY_WG_PUBKEY_CACHE_TTL = _env_int_bounded(
+        "PROXY_WG_PUBKEY_CACHE_TTL", 60, 5, 3600,
+    )
+    # When True, the wg-peer reconciler runs `wg-quick save <iface>`
+    # after a successful add/remove cycle so the peer set survives a
+    # reboot. Defaults True; the scoped sudoers rule covers the call.
+    PROXY_WG_PERSIST_ON_RECONCILE = _env_bool(
+        "PROXY_WG_PERSIST_ON_RECONCILE", True,
+    )
+    # Path to the wg-quick wrapper. The setup-wg-sudoers.sh script
+    # installs /usr/local/sbin/hobe-wg-quick as a tiny `sudo -n
+    # wg-quick "$@"` wrapper analogous to /usr/local/sbin/hobe-wg.
+    PROXY_WG_QUICK_BIN = _env("PROXY_WG_QUICK_BIN", "wg-quick")

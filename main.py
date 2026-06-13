@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import Config
 from proxy import run_proxy
 from routing_table import RoutingTable
+from wg_provisioning import CachingPubkeyProvider
 
 
 def _setup_logging(level: str) -> None:
@@ -67,6 +68,19 @@ def main() -> None:
     log.info("  Acct port : %d", Config.RADIUS_ACCT_PORT)
     log.info("  Refresh   : %ds", Config.ROUTING_REFRESH_SECONDS)
 
+    # Live wg-data pubkey provider: publishes the proxy's CURRENT
+    # `wg show wg-data public-key` value in every heartbeat so the
+    # panel renders every CHR script with the right key. Cached for
+    # PROXY_WG_PUBKEY_CACHE_TTL seconds — the key changes ~never; we
+    # don't want to fork-exec on every 30s heartbeat. Empty result
+    # (unprivileged / iface absent / wg missing) → heartbeat sends
+    # "" and the panel falls back to its stored Setting.
+    proxy_wg_data_pubkey = CachingPubkeyProvider(
+        iface=Config.FLEET_WG_INTERFACE,
+        wg_path=Config.FLEET_WG_BIN,
+        ttl_seconds=Config.PROXY_WG_PUBKEY_CACHE_TTL,
+    )
+
     routing = RoutingTable(
         admin_base_url=Config.ADMIN_BASE_URL,
         shared_secret=Config.PROXY_SHARED_SECRET,
@@ -79,6 +93,7 @@ def main() -> None:
         chr_secret_state_path=Config.CHR_SECRET_STATE_PATH,
         chr_secret_grace_seconds=Config.CHR_SECRET_GRACE_SECONDS,
         static_node_map=Config.FLEET_CHR_NODE_MAP,
+        proxy_wg_data_pubkey_provider=proxy_wg_data_pubkey,
     )
 
     if Config.FAIL_OPEN_CHR_ALLOWLIST:
