@@ -13,7 +13,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -84,6 +84,7 @@ class RoutingTable:
         chr_secret_state_path: Optional[str] = None,
         chr_secret_grace_seconds: int = _DEFAULT_CHR_SECRET_GRACE_SECONDS,
         route_secret_grace_seconds: int = _DEFAULT_ROUTE_SECRET_GRACE_SECONDS,
+        proxy_wg_data_pubkey_provider: Optional[Callable[[], str]] = None,
     ):
         self._url = admin_base_url.rstrip("/") + "/api/proxy/routing-table"
         self._chr_nodes_url = admin_base_url.rstrip("/") + "/api/proxy/chr-nodes"
@@ -154,6 +155,16 @@ class RoutingTable:
         self._load_chr_secret_state()
         if not self._chr_secret_current and self._bootstrap_chr_secret:
             self._chr_secret_current = self._bootstrap_chr_secret
+
+        # Live proxy wg-data pubkey provider (publish in heartbeat so the
+        # panel renders CHR scripts with the CURRENT proxy key, not a
+        # stale DB / Setting value — fix for the chr-vpn-2 onboarding
+        # incident). Returns "" when the helper can't read the
+        # interface; an empty value leaves the panel's stored copy
+        # untouched (the heartbeat consumer treats "" as "no signal").
+        self._proxy_wg_data_pubkey_provider: Optional[Callable[[], str]] = (
+            proxy_wg_data_pubkey_provider
+        )
 
     def _make_token(self) -> str:
         ts = int(time.time())
@@ -450,6 +461,26 @@ class RoutingTable:
             return None
         return entry.previous_secret
 
+    def _read_proxy_wg_data_pubkey(self) -> str:
+        """Best-effort live wg-data pubkey for the heartbeat. Empty
+        string when no provider is configured or the helper failed.
+        Wrapped in try/except so a provider bug can NEVER kill the
+        heartbeat — a missing pubkey is far less bad than a missing
+        heartbeat (the operator would see the proxy 'go down' on the
+        panel for an unrelated reason).
+        """
+        if self._proxy_wg_data_pubkey_provider is None:
+            return ""
+        try:
+            value = self._proxy_wg_data_pubkey_provider()
+        except Exception as exc:                              # pragma: no cover
+            log.warning(
+                "proxy_wg_data_pubkey provider raised: %s — sending empty",
+                exc,
+            )
+            return ""
+        return str(value or "").strip()
+
     def chr_secret_fingerprint(self) -> str:
         """Non-reversible fingerprint of (current secret + allowed CHR set).
 
@@ -619,6 +650,16 @@ class RoutingTable:
                 "chr_secret_grace_remaining_s": (
                     self.chr_secret_in_grace_remaining()
                 ),
+                # Live wg-data public key on THIS host, read via
+                # `wg show wg-data public-key`. The panel uses it to
+                # render every CHR's wg-data peer block — eliminates
+                # the "panel has stale proxy key, new CHR can't
+                # handshake" class of bug (the chr-vpn-2 onboarding
+                # incident). Empty string when unreadable (unprivileged
+                # / iface absent) so the panel leaves its stored value
+                # untouched. NEVER null — the panel can rely on the
+                # field being present.
+                "proxy_wg_data_pubkey": self._read_proxy_wg_data_pubkey(),
             }
             resp = requests.post(self._heartbeat_url, json=payload, headers=self._headers(), timeout=10)
             if resp.ok:

@@ -159,6 +159,14 @@ class WgPeerSync:
         endpoint_path: str = "/api/proxy/wg-peers",
         peers_json_key: str = "peers",
         log_prefix: str = "wg peer sync",
+        # After-add/remove persist hook. Production wires this to
+        # ``wg_provisioning.persist_iface`` so `wg-quick save <iface>`
+        # writes the runtime peer set back to /etc/wireguard/<iface>.conf
+        # — without this, every reboot drops the peers and the operator
+        # has to re-run `wg set ... peer ...` by hand (the chr-vpn-2
+        # incident class of bug). Tests inject a recording fake.
+        # ``None`` disables the persist step entirely.
+        persist_fn: "Optional[Callable[[], bool]]" = None,
     ) -> None:
         self._url = admin_base_url.rstrip("/") + endpoint_path
         self._peers_key = peers_json_key
@@ -174,6 +182,7 @@ class WgPeerSync:
         self._apply_mode = apply_mode
         self._runner = runner or _subprocess_runner
         self._http_get = http_get or requests.get
+        self._persist_fn = persist_fn
         # Lazy-loaded cache of pubkeys this proxy has previously written to
         # the interface — the only peers eligible for removal.
         self._managed: Optional[set[str]] = None
@@ -429,6 +438,23 @@ class WgPeerSync:
         # intend to own.
         if to_add or to_remove:
             self._save_managed(new_managed)
+            # And — critically for the chr-vpn-2 incident — write the
+            # runtime peer set back to /etc/wireguard/<iface>.conf via
+            # `wg-quick save` so the peers survive a reboot. Only when
+            # we ACTUALLY applied (not in dry-run); persistence in dry-
+            # run would write zero peers and clobber the conf file.
+            # No-op when persist_fn is None or the helper returns False.
+            if (
+                self._persist_fn is not None
+                and result.mode == "apply"
+            ):
+                try:
+                    self._persist_fn()
+                except Exception as exc:                          # pragma: no cover
+                    log.warning(
+                        "%s: persist hook crashed (swallowed): %s",
+                        self._log_prefix, exc,
+                    )
 
         if not to_add and not to_remove:
             log.debug(
