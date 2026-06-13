@@ -277,25 +277,51 @@ forever and you'll fall back to § 2.5):
 sudo bash /opt/hobe-radius-proxy/app/systemd/setup-wg-sudoers.sh
 ```
 
-That script installs:
+The script AUTO-DETECTS which user the proxy actually runs as (reads
+`systemctl show <unit> -p User --value` for `radius-proxy.service` then
+`hobe-radius-proxy.service`, falls back to `$PROXY_SERVICE_USER`, then
+to `root`) and picks one of two modes:
+
+**ROOT mode** — the systemd unit's `User=` is empty or `root` (e.g. the
+live proxy01 install: `/opt/hoberadius/radius-proxy` under `User=root`).
+The script SKIPS the sudoers + wrapper installs (root can already call
+`wg`/`wg-quick` directly) and just creates `/var/lib/hobe-radius-proxy/`.
+The env vars to set are then simply:
+
+```bash
+PROXY_WG_PEER_SYNC_ENABLED=true       # default — leave on
+PROXY_WG_BIN=/usr/bin/wg              # the in-PATH default works too
+PROXY_WG_QUICK_BIN=/usr/bin/wg-quick
+```
+
+**SCOPED mode** — the unit's `User=` is a real non-root account (e.g. the
+DEPLOY_PROXY.md walk-through creates `hobeproxy`). The script installs:
 
 - `/etc/sudoers.d/hobe-radius-proxy-wg` — a SCOPED sudoers rule allowing
-  only `wg show wg-data dump`, `wg set wg-data peer * allowed-ips *`, and
-  `wg set wg-data peer * remove`. Nothing else.
-- `/usr/local/sbin/hobe-wg` — a tiny wrapper that `exec`s `sudo -n wg "$@"`.
-- `/var/lib/hobe-radius-proxy/` — the state directory, owned by
-  `hobeproxy`.
+  only `wg show {wg-data,wg-radius} {dump,public-key}`,
+  `wg set {wg-data,wg-radius} peer * {allowed-ips * | remove}`, and
+  `wg-quick save {wg-data,wg-radius}`. Nothing else.
+- `/usr/local/sbin/hobe-wg` + `/usr/local/sbin/hobe-wg-quick` —
+  tiny wrappers that `exec sudo -n …`.
+- `/var/lib/hobe-radius-proxy/` — owned by the detected service user.
 
 Then set in `/etc/hobe-radius-proxy/env`:
 
 ```bash
 PROXY_WG_PEER_SYNC_ENABLED=true       # default — leave on
-PROXY_WG_BIN=/usr/local/sbin/hobe-wg  # required after running setup-wg-sudoers.sh
+PROXY_WG_BIN=/usr/local/sbin/hobe-wg          # required in SCOPED mode
+PROXY_WG_QUICK_BIN=/usr/local/sbin/hobe-wg-quick  # required in SCOPED mode
 # PROXY_WG_INTERFACE=wg-data          # default
 # PROXY_WG_STATE_PATH=/var/lib/hobe-radius-proxy/managed-peers.json
 # PROXY_WG_APPLY_MODE=auto             # 'auto'|'apply'|'dry_run' — leave on auto
 # PROXY_WG_PEER_SYNC_INTERVAL=60       # seconds
 ```
+
+If `User=` declares an account that doesn't exist (e.g. the unit says
+`User=hobeproxy` but no `hobeproxy` was created), the script aborts
+with concrete remediation steps (create the account, change the
+`User=`, or override via `PROXY_SERVICE_USER=…`). It will NOT silently
+"fix" a missing account by switching to root.
 
 and restart:
 
